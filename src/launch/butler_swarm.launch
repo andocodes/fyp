@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Number of agents to spawn -->
+  <arg name="num_agents" default="5"/>
+  <arg name="radius" default="3.0"/>
+  <arg name="world_name" default="$(find butler_swarm)/worlds/castle_arena.world"/>
+
+  <!-- Launch empty world -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(arg world_name)"/>
+    <arg name="paused" value="false"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="gui" value="true"/>
+    <arg name="headless" value="false"/>
+    <arg name="debug" value="false"/>
+    <arg name="verbose" value="true"/>
+  </include>
+
+  <!-- Swarm controller node -->
+  <node name="swarm_controller" pkg="butler_swarm" type="swarm_controller.py" output="screen">
+    <param name="num_agents" value="$(arg num_agents)"/>
+  </node>
+
+  <!-- Spawn agents using the script -->
+  <node name="spawn_agents_node" pkg="butler_swarm" type="spawn_agents.py" output="screen">
+    <param name="num_agents" value="$(arg num_agents)"/>
+    <param name="radius" value="$(arg radius)"/>
+  </node>
+
+  <!-- RViz for visualization -->
+  <arg name="rviz_config" default="$(find butler_swarm)/config/default_swarm.rviz" />
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(arg rviz_config)" required="true" />
+</launch>

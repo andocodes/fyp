@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="num_agents" default="5"/>
+
+  <!-- Launch world -->
+  <include file="$(find butler_swarm)/launch/world.launch"/>
+
+  <!-- Swarm controller node -->
+  <node name="swarm_controller" pkg="butler_swarm" type="swarm_controller.py" output="screen">
+    <param name="num_agents" value="$(arg num_agents)"/>
+  </node>
+
+  <!-- Spawn multiple agents in a circle -->
+  <arg name="radius" default="3.0"/>
+
+  <!-- Loop to spawn multiple agents - we'll use a separate script to generate agents -->
+  <node name="spawn_agents" pkg="butler_swarm" type="spawn_agents.py" output="screen">
+    <param name="num_agents" value="$(arg num_agents)"/>
+    <param name="radius" value="$(arg radius)"/>
+  </node>
+</launch>

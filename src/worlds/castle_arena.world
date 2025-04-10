@@ -1,0 +1,236 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="castle_arena">
+    <!-- Global light source -->
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- Grass ground plane -->
+    <model name='ground_plane'>
+      <static>true</static>
+      <link name='link'>
+        <collision name='collision'>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>75 75</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name='visual'>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>75 75</size>
+            </plane>
+          </geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Grass</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Castle Boundary Walls -->
+    <model name='castle_wall_north'>
+      <static>true</static>
+      <pose frame=''>0 37.4 1.0 0 0 0</pose> <!-- Positioned just inside 75x75 edge, height 2m -->
+      <link name='link'>
+        <collision name='collision'>
+          <geometry><box><size>75 0.2 2</size></box></geometry>
+        </collision>
+        <visual name='visual'>
+          <geometry><box><size>75 0.2 2</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/BumpyBrick</name></script></material>
+        </visual>
+      </link>
+    </model>
+    <model name='castle_wall_south'>
+      <static>true</static>
+      <pose frame=''>0 -37.4 1.0 0 0 0</pose>
+      <link name='link'>
+        <collision name='collision'>
+          <geometry><box><size>75 0.2 2</size></box></geometry>
+        </collision>
+        <visual name='visual'>
+          <geometry><box><size>75 0.2 2</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/BumpyBrick</name></script></material>
+        </visual>
+      </link>
+    </model>
+    <model name='castle_wall_east'>
+      <static>true</static>
+      <pose frame=''>37.4 0 1.0 0 0 1.5707</pose> <!-- Rotated 90 deg -->
+      <link name='link'>
+        <collision name='collision'>
+          <geometry><box><size>75 0.2 2</size></box></geometry> <!-- Length along new Y (world X) -->
+        </collision>
+        <visual name='visual'>
+          <geometry><box><size>75 0.2 2</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/BumpyBrick</name></script></material>
+        </visual>
+      </link>
+    </model>
+    <model name='castle_wall_west'>
+      <static>true</static>
+      <pose frame=''>-37.4 0 1.0 0 0 1.5707</pose> <!-- Rotated 90 deg -->
+      <link name='link'>
+        <collision name='collision'>
+          <geometry><box><size>75 0.2 2</size></box></geometry> <!-- Length along new Y (world X) -->
+        </collision>
+        <visual name='visual'>
+          <geometry><box><size>75 0.2 2</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/BumpyBrick</name></script></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- *** ADDED INTERNAL WALLS *** -->
+    <model name='internal_wall_1'>
+      <static>true</static>
+      <pose frame=''>0 10 1.0 0 0 0</pose> 
+      <link name='link'>
+        <collision name='collision'>
+          <geometry><box><size>30 0.2 2</size></box></geometry>
+        </collision>
+        <visual name='visual'>
+          <geometry><box><size>30 0.2 2</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/BumpyBrick</name></script></material>
+        </visual>
+      </link>
+    </model>
+    <model name='internal_wall_2'>
+      <static>true</static>
+      <pose frame=''>-10 -10 1.0 0 0 1.5707</pose> <!-- Rotated -->
+      <link name='link'>
+        <collision name='collision'>
+          <geometry><box><size>30 0.2 2</size></box></geometry> 
+        </collision>
+        <visual name='visual'>
+          <geometry><box><size>30 0.2 2</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/BumpyBrick</name></script></material>
+        </visual>
+      </link>
+    </model>
+    <model name='internal_wall_3'>
+      <static>true</static>
+      <pose frame=''>15 -5 1.0 0 0 0</pose> 
+      <link name='link'>
+        <collision name='collision'>
+          <geometry><box><size>20 0.2 2</size></box></geometry>
+        </collision>
+        <visual name='visual'>
+          <geometry><box><size>20 0.2 2</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/BumpyBrick</name></script></material>
+        </visual>
+      </link>
+    </model>
+    <!-- *** END ADDED INTERNAL WALLS *** -->
+
+    <!-- Rock Obstacles -->
+    <model name='rock_1'>
+        <static>true</static>
+        <pose frame=''>10 15 0.5 0 0 0.4</pose>
+        <link name='link'>
+          <collision name='collision'>
+            <geometry><sphere><radius>1.2</radius></sphere></geometry>
+          </collision>
+          <visual name='visual'>
+            <geometry><sphere><radius>1.2</radius></sphere></geometry>
+            <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Rock</name></script></material>
+          </visual>
+        </link>
+      </model>
+    <model name='rock_2'>
+        <static>true</static>
+        <pose frame=''>-20 -10 0.75 0.1 0.2 0.8</pose>
+        <link name='link'>
+          <collision name='collision'>
+            <geometry><box><size>2.5 2 1.5</size></box></geometry>
+          </collision>
+          <visual name='visual'>
+            <geometry><box><size>2.5 2 1.5</size></box></geometry>
+            <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Rock</name></script></material>
+          </visual>
+        </link>
+      </model>
+    <model name='rock_3'>
+        <static>true</static>
+        <pose frame=''>5 -25 0.6 0 0 0</pose>
+        <link name='link'>
+          <collision name='collision'>
+            <geometry><sphere><radius>1.1</radius></sphere></geometry>
+          </collision>
+          <visual name='visual'>
+            <geometry><sphere><radius>1.1</radius></sphere></geometry>
+            <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Rock</name></script></material>
+          </visual>
+        </link>
+      </model>
+    <model name='rock_4'>
+        <static>true</static>
+        <pose frame=''>-15 20 0.4 0.3 -0.1 0.2</pose>
+        <link name='link'>
+          <collision name='collision'>
+            <geometry><box><size>1.5 3.5 0.8</size></box></geometry>
+          </collision>
+          <visual name='visual'>
+            <geometry><box><size>1.5 3.5 0.8</size></box></geometry>
+            <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Rock</name></script></material>
+          </visual>
+        </link>
+      </model>
+
+    <!-- Golden Apple (Static Position for now) -->
+    <model name='apple_of_eden'>
+        <static>true</static>
+        <pose frame=''>0 0 0.25 0 0 0</pose> <!-- Centered -->
+        <link name='link'>
+          <collision name='collision'>
+            <geometry>
+              <sphere><radius>0.25</radius></sphere>
+            </geometry>
+          </collision>
+          <visual name='visual'>
+            <geometry>
+              <sphere><radius>0.25</radius></sphere>
+            </geometry>
+            <material>
+              <script><name>Gazebo/Gold</name></script> <!-- Using basic gold -->
+              <ambient>1 0.9 0 1</ambient>
+              <diffuse>1 0.9 0 1</diffuse>
+              <specular>0.5 0.5 0.5 1</specular>
+              <emissive>0.8 0.7 0 1</emissive> <!-- Make it glow slightly -->
+            </material>
+          </visual>
+        </link>
+      </model>
+
+    <!-- Physics settings -->
+    <physics name='default_physics' default='0' type='ode'>
+      <real_time_update_rate>1000.0</real_time_update_rate>
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1</real_time_factor>
+      <ode>
+        <solver>
+          <type>quick</type>
+          <iters>150</iters>
+          <precon_iters>0</precon_iters>
+          <sor>1.400000</sor>
+        </solver>
+        <constraints>
+          <cfm>1.000000e-05</cfm>
+          <erp>0.200000</erp>
+          <contact_max_correcting_vel>2000.000000</contact_max_correcting_vel>
+          <contact_surface_layer>0.01000</contact_surface_layer>
+        </constraints>
+      </ode>
+    </physics>
+
+    <!-- Scene settings -->
+    <scene>
+      <ambient>0.4 0.4 0.4 1</ambient>
+      <background>0.7 0.7 0.7 1</background>
+      <shadows>true</shadows>
+    </scene>
+  </world>
+</sdf> 
