@@ -40,19 +40,18 @@ class SearchBehaviour:
 
         # Target position
         self.target_position = None
-        self.current_path = None # Add state for storing the A* path
-        self.current_path_index = 0 # Add state for tracking progress along the path
+        self.current_path = None
+        self.current_path_index = 0
 
-        # --- A* Pathfinding Control ---
-        self.MAX_ASTAR_ATTEMPTS_PER_CYCLE = 5 # Limit computation
+        self.MAX_ASTAR_ATTEMPTS_PER_CYCLE = 5
 
     def compute(self):
         """Compute the movement vector based on search strategy."""
-        # --- Reactive Obstacle Avoidance ---
-        OBSTACLE_DISTANCE_THRESHOLD = 0.7 # Increased detection distance
-        OBSTACLE_WIDTH_THRESHOLD = 0.5  # Increased detection width
+        # Reactive Obstacle Avoidance
+        OBSTACLE_DISTANCE_THRESHOLD = 0.7
+        OBSTACLE_WIDTH_THRESHOLD = 0.5
         TURN_SPEED = self.max_angular_speed
-        SAFE_LINEAR_SPEED = 0.1 # Slow down when avoiding
+        SAFE_LINEAR_SPEED = 0.1
         TURN_SCALING = 1.5 
 
         turn_force = 0.0
@@ -73,7 +72,7 @@ class SearchBehaviour:
             # If avoiding obstacle, clear any existing path plan
             self.current_path = None 
             self.current_path_index = 0
-            self.target_position = None # Clear final target too
+            self.target_position = None
             rospy.loginfo_throttle(1.0, f"Agent {self.agent.agent_id}: Obstacle detected! Distance: {closest_obs_dist:.2f}, Turn Force: {turn_force:.2f}")
             if abs(turn_force) > 0:
                 final_angular_z = np.clip(turn_force * TURN_SCALING, -TURN_SPEED, TURN_SPEED)
@@ -85,12 +84,12 @@ class SearchBehaviour:
             rospy.loginfo_throttle(1.0, f"Agent {self.agent.agent_id}: Avoidance maneuver: l={final_linear_x:.2f}, a={final_angular_z:.2f}")
             return final_linear_x, final_angular_z
 
-        # --- Frontier Exploration --- 
+        # Frontier Exploration
         self._update_grid()
         self._share_map()
         self._integrate_shared_maps()
         if self.update_count % 10 == 0:
-            self._visualize_grid() # Also visualize path later
+            self._visualize_grid()
         self.update_count += 1
 
         # Target/Path Management
@@ -98,14 +97,14 @@ class SearchBehaviour:
         if self.current_path:
             # Check if we've reached the current waypoint
             current_waypoint_world = self._grid_to_world(*self.current_path[self.current_path_index])
-            if np.linalg.norm(current_waypoint_world - self.agent.position[:2]) < self.cell_size * 0.6: # Threshold based on cell size
+            if np.linalg.norm(current_waypoint_world - self.agent.position[:2]) < self.cell_size * 0.6:
                 self.current_path_index += 1
                 if self.current_path_index >= len(self.current_path):
                     # Reached end of path (final target)
                     rospy.loginfo(f"Agent {self.agent.agent_id}: Reached end of path for target {self.target_position}.")
                     self.current_path = None
                     self.current_path_index = 0
-                    self.target_position = None # Clear final target, force replan
+                    self.target_position = None
                     replan_needed = True
                 else:
                      rospy.loginfo(f"Agent {self.agent.agent_id}: Reached waypoint {self.current_path_index-1}, moving to waypoint {self.current_path_index} {self.current_path[self.current_path_index]}.")
@@ -118,10 +117,9 @@ class SearchBehaviour:
             selected_target_world, planned_path = self._select_frontier_and_plan_path()
             if selected_target_world is not None and planned_path is not None:
                 rospy.loginfo(f"Agent {self.agent.agent_id}: New target selected {selected_target_world} with path of length {len(planned_path)}.")
-                self.target_position = selected_target_world # Store final world goal
-                self.current_path = planned_path         # Store grid path
-                self.current_path_index = 1               # Start moving towards the *second* node (index 1) as index 0 is the start
-                # Handle path of length 1 (start=goal)? A* should prevent this if start!=goal.
+                self.target_position = selected_target_world
+                self.current_path = planned_path
+                self.current_path_index = 1
                 if len(self.current_path) <= 1:
                      rospy.logwarn(f"Agent {self.agent.agent_id}: Path generated has length <= 1. Clearing path.")
                      self.current_path = None
@@ -132,18 +130,16 @@ class SearchBehaviour:
                  self.current_path = None
                  self.current_path_index = 0
 
-        # --- Movement --- 
+        # Movement
         # No path / No target -> Stop
         if self.current_path is None or self.current_path_index >= len(self.current_path):
              rospy.loginfo_throttle(5.0, f"Agent {self.agent.agent_id}: No path or target, stopping.")
-             # Visualize grid without path/target markers if desired
              self._visualize_grid(visualize_path=False, visualize_target=False)
              return 0.0, 0.0
 
         # Follow the current path
         next_waypoint_grid = self.current_path[self.current_path_index]
         linear_x, angular_z = self._move_to_waypoint(next_waypoint_grid)
-        # Visualize grid, current path, and final target
         self._visualize_grid(visualize_path=True, visualize_target=True) 
         return linear_x, angular_z
 
@@ -162,14 +158,7 @@ class SearchBehaviour:
         # Mark cells within sensor range as visited or obstacles
         for obs in getattr(self.agent, 'obstacles', []):
             # Convert obstacle position (relative to agent) to world coordinates
-            # Note: This assumes obs are in agent's forward-facing frame (X forward)
-            # If laser is mounted differently, need transformation here.
             current_pos = self.agent.position[:2]
-            # Assuming obs[0] is X (forward) and obs[1] is Y (left) in agent frame
-            # We might need rotation based on agent heading if obs aren't pre-rotated
-            # Let's assume for now that getattr returns obstacles in world-aligned frame for simplicity
-            # BASED ON scan_callback, obs are RELATIVE (x,y) in laser frame, aligned with base_link
-            # So we DO need to rotate them based on agent heading
             _, _, current_heading = self._get_euler_from_quaternion()
             obs_world_x = current_pos[0] + obs[0] * np.cos(current_heading) - obs[1] * np.sin(current_heading)
             obs_world_y = current_pos[1] + obs[0] * np.sin(current_heading) + obs[1] * np.cos(current_heading)
@@ -178,11 +167,8 @@ class SearchBehaviour:
             grid_x, grid_y = self._world_to_grid(obs_world_x, obs_world_y)
 
             if 0 <= grid_x < self.grid_dims and 0 <= grid_y < self.grid_dims:
-                # ---- Add check: Don't mark agent's own cell as obstacle ----
                 if (grid_x, grid_y) != (agent_grid_x, agent_grid_y):
                     self.grid[grid_x, grid_y] = 2 # Mark as obstacle
-                # else: # Optional: log if self-scan is detected
-                     # rospy.logdebug_throttle(10.0, f"Agent {self.agent.agent_id}: Ignored obstacle marking for own cell ({grid_x},{grid_y}) from scan.")
 
                 # Mark cells between agent and obstacle as free space (visited)
                 # Check bounds before calling mark_line

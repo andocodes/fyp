@@ -1,0 +1,22 @@
+{
+  "Physics simulation stability": {
+    "impact": "Frequent crashes with multiple agents",
+    "resolution": "Tuned parameters, limited agents"
+  },
+  "ROS topic namespacing": {
+    "impact": "Communication errors",
+    "resolution": "Implemented structured namespace scheme"
+  },
+  "ROS to ROS2 migration": {
+    "impact": "Failed",
+    "resolution": "Reverted to ROS Noetic due to sensor compatibility"
+  },
+  "Computational performance": {
+    "impact": "Slow simulation",
+    "resolution": "Reduced simulation complexity, limited agents"
+  },
+  "Obstacle avoidance in complex environments": {
+    "impact": "Navigation failures",
+    "resolution": "Developed SAM state machine"
+  }
+}

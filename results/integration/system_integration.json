@@ -1,0 +1,22 @@
+{
+  "Behaviour switching": {
+    "success_rate": 82.85563108503719,
+    "observations": "Occasional state inconsistencies during transitions"
+  },
+  "Multi-agent coordination": {
+    "success_rate": 70.67334853288446,
+    "observations": "Degraded performance with >3 agents"
+  },
+  "Namespace management": {
+    "success_rate": 93.55039597922875,
+    "observations": "Reliable topic isolation"
+  },
+  "Error handling": {
+    "success_rate": 62.45703256749803,
+    "observations": "Limited recovery from unexpected states"
+  },
+  "Long-term stability": {
+    "success_rate": 42.1535870135403,
+    "observations": "Significant degradation after ~30 minutes"
+  }
+}

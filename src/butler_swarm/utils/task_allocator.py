@@ -3,7 +3,7 @@
 import rospy
 import numpy as np
 import random
-import time # Might be needed, though rospy.sleep is preferred
+import time
 
 class TaskAllocator:
     """Handles task allocation for behaviours using a bidding mechanism."""
@@ -16,18 +16,16 @@ class TaskAllocator:
             behaviour: The behaviour instance requesting allocation (e.g., ExploreBehaviour).
         """
         self.agent = agent
-        self.behaviour = behaviour # Provides grid, pathfinding, etc.
+        self.behaviour = behaviour
 
         # Store bids received during a bidding window
         # Format: { task_id: [ {'agent_id': agent_id, 'cost': cost}, ... ], ... }
         self.received_bids = {}
-        self.bid_window_start_time = None # Track when the window opens
+        self.bid_window_start_time = None
 
         # Configuration
-        # *** INCREASED BIDDING WINDOW and added wait after bid ***
-        self.BIDDING_WINDOW_DURATION = rospy.Duration(1.5) # Further increased to 1.5s
-        self.POST_BID_WAIT_DURATION = rospy.Duration(0.6) # Further increased to 0.6s
-        # ------------------------------------------------------
+        self.BIDDING_WINDOW_DURATION = rospy.Duration(1.5)
+        self.POST_BID_WAIT_DURATION = rospy.Duration(0.6)
 
         rospy.logdebug(f"Agent {self.agent.agent_id}: TaskAllocator initialized for behaviour {type(behaviour).__name__}")
 
@@ -50,28 +48,20 @@ class TaskAllocator:
         potential_bids = {}
         my_pos_grid = self.behaviour._world_to_grid(self.agent.position[0], self.agent.position[1])
 
-        # --- Step 1: Calculate Costs/Utilities for potential tasks --- #
+        # Calculate Costs/Utilities for potential tasks
         for f_id, f_data in candidate_frontiers.items():
             f_pos_world = f_data.get('position')
             if not f_pos_world:
                 rospy.logwarn_throttle(5.0, f"Agent {self.agent.agent_id} Allocator: Frontier {f_id} missing position data.")
                 continue
-            f_pos_grid = self.behaviour._world_to_grid(f_pos_world[0], f_pos_world[1])
 
-            # --- Pre-check Reachability (Optional but can save pathfinding time) --- #
-            # Note: _find_path already handles unreachability, so this is an optimization
-            # if not self.behaviour._is_reachable(my_pos_grid, f_pos_grid): 
-            #     rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Skipping frontier {f_id} - pre-check unreachable.")
-            #     continue
-            
-            # --- Calculate Cost (Pathfinding) --- #
-            path, cost = self.behaviour._find_path(my_pos_grid, f_pos_grid)
+            # Calculate Cost (Pathfinding)
+            path, cost = self.behaviour._find_path(my_pos_grid, self.behaviour._world_to_grid(f_pos_world[0], f_pos_world[1]))
             if path is None:
                 rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Pathfinding failed for {f_id} (cost=inf). Skipping bid.")
                 continue
-            # -------------------------------------- #
 
-            # --- Calculate Utility (Example: Inverse Cost) --- #
+            # Calculate Utility (Example: Inverse Cost)
             utility = 1.0 / (cost + 1e-6)
             rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Candidate {f_id}, Cost={cost:.2f}, Utility={utility:.4f}")
 
@@ -82,7 +72,7 @@ class TaskAllocator:
             rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: No reachable candidate frontiers found.")
             return None, None
 
-        # --- Step 2: Publish Bids for all potentially reachable tasks --- # 
+        # Publish Bids for all potentially reachable tasks
         bids_published_count = 0
         for f_id, bid_info in potential_bids.items():
             bid_message = {
@@ -90,31 +80,29 @@ class TaskAllocator:
                 'agent_id': self.agent.agent_id,
                 'task_id': f_id,
                 'cost': bid_info['cost'],
-                'bid_value': bid_info['utility'] # Include utility for potential future strategies
+                'bid_value': bid_info['utility']
             }
             self.agent.comm.publish('task_bids', bid_message)
             bids_published_count += 1
         rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Published {bids_published_count} bids.")
 
-        # --- Step 3: Wait briefly for own bids to propagate and others to respond --- #
+        # Wait briefly for own bids to propagate and others to respond
         rospy.sleep(self.POST_BID_WAIT_DURATION)
 
-        # --- Step 4: Continue waiting for the rest of the bidding window --- #
+        # Continue waiting for the rest of the bidding window
         rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Post-bid wait finished. Checking remaining window time.")
         time_elapsed = rospy.Time.now() - self.bid_window_start_time
         remaining_wait = self.BIDDING_WINDOW_DURATION - time_elapsed
         if remaining_wait > rospy.Duration(0):
             rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Waiting remaining {remaining_wait.to_sec():.2f}s of bidding window.")
             rospy.sleep(remaining_wait)
-        # --- Log final received bids before determining winner --- #
         rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Bidding window closed. Final received bids before win determination: {self.received_bids}")
-        # ------------------------------------------------------- #
 
-        # --- Step 5: Determine Winners based on all bids received --- #
-        winners = self._determine_winners(potential_bids) # Pass potential bids for own cost info
+        # Determine Winners based on all bids received
+        winners = self._determine_winners(potential_bids)
         rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Determined winners: {winners}")
 
-        # --- Step 6: Filter tasks won by this agent --- #
+        # Filter tasks won by this agent
         won_tasks = {tid: potential_bids[tid] for tid, winner_id in winners.items() 
                      if winner_id == self.agent.agent_id and tid in potential_bids}
         rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Tasks potentially won by me: {list(won_tasks.keys())}")
@@ -123,53 +111,37 @@ class TaskAllocator:
             rospy.loginfo(f"Agent {self.agent.agent_id}: Did not win any tasks this round.")
             return None, None
 
-        # --- Step 7: Select the single best task among the ones won (e.g., highest utility) --- #
+        # Select the single best task among the ones won (e.g., highest utility)
         best_task_id = None
         best_utility = -float('inf')
         best_path = None
 
         for task_id, task_info in won_tasks.items():
-            # --- Recalculate utility based on current state if needed, or use stored one --- #
             # Using stored utility for now, assuming it doesn't change drastically during bidding window
-            current_utility = task_info['utility'] 
-            # Example using potential/distance (uncomment if preferred, but might be redundant if utility calc is stable):
-            # task_pos = task_info['data'].get('position')
-            # if not task_pos: continue
-            # f_grid_x, f_grid_y = self.behaviour._world_to_grid(task_pos[0], task_pos[1])
-            # distance = task_info['cost'] # Use path cost as distance approximation
-            # potential = 0
-            # for dx in range(-1, 2):
-            #     for dy in range(-1, 2):
-            #         if dx == 0 and dy == 0: continue
-            #         nx, ny = f_grid_x + dx, f_grid_y + dy
-            #         if 0 <= nx < self.behaviour.grid_dims and 0 <= ny < self.behaviour.grid_dims and self.behaviour.grid[nx, ny] == 0:
-            #             potential += 1
-            # current_utility = potential * 1.0 - distance * 0.5 # Or some other weighting
-            # -----------------------------------------------------------------------------
-
+            current_utility = task_info['utility']
             rospy.logdebug(f"Agent {self.agent.agent_id} Allocator: Evaluating won task {task_id}, Utility: {current_utility:.4f}")
             if current_utility > best_utility:
                  best_utility = current_utility
                  best_task_id = task_id
                  best_path = task_info['path']
 
-        # --- Step 8: If a best task was chosen, PUBLISH CLAIM and return --- #
+        # If a best task was chosen, publish claim and return
         if best_task_id:
             rospy.loginfo(f"Agent {self.agent.agent_id}: Selected task {best_task_id} (Cost: {won_tasks[best_task_id]['cost']:.2f}, Util: {best_utility:.4f}) from won tasks.")
-            # --- Publish the claim NOW using comm module --- #
+            # Publish the claim
             claim_message = {
                 'type': 'CLAIM',
                 'agent_id': self.agent.agent_id,
                 'task_id': best_task_id,
             }
-            self.agent.comm.publish('task_bids', claim_message) # Publish claim on the same topic as bids for processing
+            self.agent.comm.publish('task_bids', claim_message)
             rospy.loginfo(f"Agent {self.agent.agent_id}: Published claim for frontier {best_task_id}")
-            # -------------------------------------------- #
-            # --- Optionally, update local status immediately for responsiveness --- # 
+            
+            # Update local status immediately for responsiveness
             if best_task_id in self.behaviour.known_frontiers:
                  self.behaviour.known_frontiers[best_task_id]['status'] = 'claimed'
                  self.behaviour.known_frontiers[best_task_id]['claimant_agent_id'] = self.agent.agent_id
-            # -------------------------------------------------------------------- #
+                 
             return best_task_id, best_path
         else:
             # This case means the agent won bids, but the utility calculation/selection failed

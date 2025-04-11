@@ -3,43 +3,737 @@
 import rospy
 import numpy as np
 import json
-import tf2_ros # For TF lookups
-import tf2_geometry_msgs # For transforming geometry_msgs
-from geometry_msgs.msg import PointStamped
-import tf.transformations # Added for euler_from_quaternion
-import heapq # Added for A*
-from nav_msgs.msg import OccupancyGrid, MapMetaData # For grid visualization
-from geometry_msgs.msg import Pose, PoseStamped # For OccupancyGrid origin and Path poses
-from nav_msgs.msg import Path # For path visualization
-import collections # Added for BFS
+import tf2_ros
+import tf2_geometry_msgs
+from geometry_msgs.msg import PointStamped, Point
+import tf.transformations
+import heapq
+from nav_msgs.msg import OccupancyGrid, MapMetaData
+from geometry_msgs.msg import Pose, PoseStamped
+from nav_msgs.msg import Path
+import collections
+import math
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import ColorRGBA
 
-# --- Import Task Allocator --- #
-from ..utils.task_allocator import TaskAllocator
-# --------------------------- #
+from .avoidance_base import ObstacleAvoidanceBehaviour
 
-# Assuming navigation/frontier detection utilities will be needed later
-# from ..utils.navigation import navigate_to_point, detect_frontiers
-# from ..utils.costmap import Costmap # Or however costmap is accessed
+# Define grid state constants
+GRID_UNKNOWN = 0
+GRID_FREE = 1
+GRID_OBSTACLE = 2
+GRID_INFLATED = 3
 
-class ExploreBehaviour:
-    """Behaviour for coordinated multi-agent exploration using frontier sharing."""
+class ExploreBehaviour(ObstacleAvoidanceBehaviour):
+    """Behaviour for collaborative exploration using frontier detection and task allocation."""
 
     def __init__(self, agent):
         """Initialize the Explore behaviour."""
-        self.agent = agent
+        super(ExploreBehaviour, self).__init__(agent)
+
+        self.OBSTACLE_DISTANCE_THRESHOLD = 0.5  # Distance threshold to consider an obstacle (meters)
+        
+        self.max_linear_speed = rospy.get_param('~explore/max_linear_speed', 0.5)  # m/s
+        self.max_angular_speed = rospy.get_param('~explore/max_angular_speed', 1.0)  # rad/s
+        
         self.known_frontiers = {}  # Store frontiers: {frontier_id: frontier_data_dict}
         self.current_target_frontier_id = None
 
-        # --- Grid Map Parameters (from SearchBehaviour) ---
-        self.map_size = 20.0  # meters
-        self.cell_size = 0.5  # meters - *** REDUCED from 1.0 for finer A* ***
-        self.grid_dims = int(self.map_size / self.cell_size) # Recalculate dimensions
+        # Grid Map Parameters
+        self.map_size = rospy.get_param('~explore/map_size', 20.0)  # meters
+        self.cell_size = rospy.get_param('~explore/cell_size', 0.5) # meters
+        if self.cell_size <= 0:
+             rospy.logwarn("Cell size must be positive, defaulting to 0.5m")
+             self.cell_size = 0.5
+        self.grid_dims = int(self.map_size / self.cell_size) 
         # Initialize grid (0: unknown, 1: free/visited, 2: obstacle, 3: inflated obstacle)
+        # Center the initial grid around (0,0) in world coords
+        # Grid index (0,0) corresponds to world (-map_size/2, -map_size/2)
+        self.grid_origin_offset = np.array([-self.map_size/2.0, -self.map_size/2.0])
         self.grid = np.zeros((self.grid_dims, self.grid_dims), dtype=np.int8)
+        # Mark initial cell around (0,0) as free maybe? Or rely on first scan.
+        initial_grid_x, initial_grid_y = self._world_to_grid(0.0, 0.0)
+        if 0 <= initial_grid_x < self.grid_dims and 0 <= initial_grid_y < self.grid_dims:
+             self.grid[initial_grid_x, initial_grid_y] = GRID_FREE 
 
-        # --- Path Planning State (from SearchBehaviour) ---
+        # Inflation parameters (currently unused by logic, but keep params)
+        self.inflation_radius_cells = rospy.get_param('~explore/inflation_radius_cells', 2) # cells 
+
+        # --- Path Planning State --- 
         self.current_path = None # List of (grid_x, grid_y) tuples
         self.current_path_index = 0 # Index of the next waypoint in current_path
+        
+        # --- Movement parameters (Use agent's max speeds) ---
+        # Using self.agent properties: self.agent.max_linear_speed, self.agent.max_angular_speed
+
+        # --- Termination State --- #
+        self.exploration_complete = False
+        self.last_activity_time = rospy.Time.now() # Initialize for timeout check
+        self.no_frontiers_timeout = rospy.Duration(rospy.get_param('~explore/no_frontiers_timeout', 15.0)) # Stop after X sec of no open frontiers
+        self.path_planning_failures = {} # Track consecutive A* failures per frontier
+        self.MAX_PATH_FAILURES = rospy.get_param('~explore/max_path_failures', 3) # Release claim after this many consecutive failures
+
+        # --- Path Stuck Detection --- #
+        self.last_path_progress_time = None
+        self.last_path_position = None
+        self.PATH_STUCK_TIMEOUT = rospy.Duration(rospy.get_param('~explore/path_stuck_timeout', 7.0)) # Timeout if no progress on path
+        self.MIN_PROGRESS_DIST = self.cell_size * 0.5 # Min distance moved to count as progress
+
+        # --- TF Listener --- #
+        # Use agent's TF buffer and listener (initialized in base class, but use agent's instance)
+        self.tf_buffer = self.agent.tf_buffer
+        self.tf_listener = self.agent.tf_listener # Reuse agent's listener
+        # Frame names
+        self.odom_frame = f"{self.agent.agent_name}/odom"
+        self.base_frame = self.agent.base_frame # Use agent's base frame
+        self.laser_frame = self.agent.laser_frame # Use agent's laser frame
+
+        # Publishers for visualization
+        self.grid_pub = rospy.Publisher(f'/{self.agent.agent_name}/explore_grid', Marker, queue_size=2, latch=True)
+        self.path_pub = rospy.Publisher(f'/{self.agent.agent_name}/explore_path', Marker, queue_size=2, latch=True)
+        self.frontier_pub = rospy.Publisher(f'/{self.agent.agent_name}/explore_frontiers', MarkerArray, queue_size=5, latch=True)
+
+        # Register callback for frontier updates from other agents
+        self.agent.comm.register_callback('frontiers', self.frontier_update_callback)
+
+        # Initialize timers to None
+        self.update_grid_timer = None
+        self.frontier_publish_timer = None
+        self.visualization_timer = None
+        self.bidding_timer = None
+
+        rospy.loginfo(f"Explore behaviour for agent {self.agent.agent_id} initialized.")
+        rospy.loginfo(f"Grid Dimensions: {self.grid_dims}x{self.grid_dims} ({self.map_size}m @ {self.cell_size}m/cell)")
+
+    def start(self):
+        """Start the timers for background processing when Explore behaviour becomes active."""
+        rospy.loginfo(f"Agent {self.agent.agent_id}: Starting Explore behaviour timers.")
+        # Shutdown existing timers first to prevent duplicates if start is called again
+        self.stop()
+        
+        # Start timers
+        self.update_grid_timer = rospy.Timer(rospy.Duration(0.1), self._update_grid_callback) # 10 Hz
+        self.frontier_publish_timer = rospy.Timer(rospy.Duration(2.0), self._publish_frontiers_callback) # 0.5 Hz
+        self.visualization_timer = rospy.Timer(rospy.Duration(0.5), self._visualization_callback) # 2 Hz
+        self.bidding_timer = rospy.Timer(rospy.Duration(1.0), self._bidding_cycle_callback) # 1 Hz
+        # Reset relevant state when starting?
+        self.last_activity_time = rospy.Time.now() # Reset activity timer
+        self.exploration_complete = False # Ensure not marked complete
+
+    def stop(self):
+        """Stop the timers and reset state when Explore behaviour becomes inactive."""
+        rospy.loginfo(f"Agent {self.agent.agent_id}: Stopping Explore behaviour timers.")
+        if self.update_grid_timer:
+            self.update_grid_timer.shutdown()
+            self.update_grid_timer = None
+        if self.frontier_publish_timer:
+            self.frontier_publish_timer.shutdown()
+            self.frontier_publish_timer = None
+        if self.visualization_timer:
+            self.visualization_timer.shutdown()
+            self.visualization_timer = None
+        if self.bidding_timer:
+            self.bidding_timer.shutdown()
+            self.bidding_timer = None
+        
+        # Reset path and target when stopping explore
+        self.current_path = None
+        if self.current_target_frontier_id:
+             # Optionally release claim if stopping? Or assume switch is temporary?
+             # Let's not release claim automatically on stop for now.
+             pass 
+        self.current_target_frontier_id = None
+        self._publish_current_path() # Publish empty path to clear RViz
+        # Reset path progress state
+        self.last_path_position = None
+        self.last_path_progress_time = None
+        # Let's keep avoidance state persistent for now.
+        # self.avoidance_state = 'none'
+        # self.stuck_start_time = None
+
+    def compute(self):
+        """Compute movement commands for exploration."""
+        # === Initial State Debug Logging START ===
+        try:
+            agent_pos = self.agent.position[:2]
+            agent_grid_x, agent_grid_y = self._world_to_grid(agent_pos[0], agent_pos[1])
+            current_cell_state = "OOB" # Out Of Bounds
+            if 0 <= agent_grid_x < self.grid_dims and 0 <= agent_grid_y < self.grid_dims:
+                current_cell_state = self.grid[agent_grid_x, agent_grid_y]
+            rospy.logdebug(f"Agent {self.agent.agent_id} Compute Start: Pos=({agent_pos[0]:.2f},{agent_pos[1]:.2f}), Grid=({agent_grid_x},{agent_grid_y}), GridState={current_cell_state}")
+        except Exception as e:
+            rospy.logwarn(f"Agent {self.agent.agent_id} Compute Start: Error getting initial grid state: {e}")
+        # === Initial State Debug Logging END ===
+
+        # --- Check for Termination Conditions --- #
+        if self.exploration_complete:
+            rospy.loginfo_once(f"Agent {self.agent.agent_id}: Exploration complete. Stopping.")
+            return 0.0, 0.0
+        # Check if timed out due to no frontiers
+        if self.last_activity_time and (rospy.Time.now() - self.last_activity_time > self.no_frontiers_timeout):
+             rospy.logwarn(f"Agent {self.agent.agent_id}: No activity/open frontiers for {self.no_frontiers_timeout.to_sec()}s. Exploration timed out.")
+             self.exploration_complete = True
+             return 0.0, 0.0
+
+        # --- Compute Avoidance / Recovery --- #
+        # Call the base class method to check state and compute avoidance velocities
+        avoid_linear_x, avoid_angular_z, should_override = self.compute_avoidance()
+        if should_override:
+             # If compute_avoidance returns override=True, use its velocities
+             return avoid_linear_x, avoid_angular_z
+        # --- End Avoidance / Recovery --- #
+
+        # --- Normal Exploration Logic (Path Following or Task Selection) --- #
+        linear_x, angular_z = 0.0, 0.0
+        
+        # If we have a path, follow it
+        if self.current_path:
+            linear_x, angular_z = self._follow_path()
+            # Check if path following resulted in being stuck (triggers avoidance/recovery)
+            self._check_path_progress()
+        else:
+            # No path: Find and claim a new target frontier (handled by bidding cycle)
+            rospy.logdebug_throttle(5.0, f"Agent {self.agent.agent_id}: No current path. Waiting for bidding cycle to select target.")
+            # While waiting for a path, maybe just spin slowly?
+            linear_x = 0.0
+            angular_z = 0.1 # Slow rotation while idle?
+
+        return linear_x, angular_z
+
+    def _check_path_progress(self):
+        """Checks if the agent is making progress along the current path."""
+        if not self.current_path or self.avoidance_state != 'none':
+            # Don't check progress if no path or currently avoiding/recovering
+            return
+
+        now = rospy.Time.now()
+        current_pos = self.agent.position[:2]
+
+        if self.last_path_position is None:
+            # Initialize on first check
+            self.last_path_position = current_pos
+            self.last_path_progress_time = now
+            return
+
+        distance_moved = np.linalg.norm(current_pos - self.last_path_position)
+
+        if distance_moved >= self.MIN_PROGRESS_DIST:
+            # Made progress, reset timer and position
+            self.last_path_position = current_pos
+            self.last_path_progress_time = now
+            rospy.logdebug(f"Agent {self.agent.agent_id}: Path progress detected ({distance_moved:.2f}m). Resetting stuck timer.")
+        elif (now - self.last_path_progress_time) > self.PATH_STUCK_TIMEOUT:
+            # No progress for too long, likely stuck!
+            rospy.logwarn(f"Agent {self.agent.agent_id}: Detected path stuck! No progress for {self.PATH_STUCK_TIMEOUT.to_sec()}s. Distance moved: {distance_moved:.2f}m. Triggering recovery.")
+            # Reset path (or should we try recovery first?)
+            # For now, let's trigger recovery and keep the path
+            # self.current_path = None
+            # self._publish_current_path()
+            # Start recovery jiggle
+            self.avoidance_state = 'recovery_jiggle'
+            self.recovery_state = None # Will be set to 'backward' by compute_avoidance
+            self.stuck_start_time = now # Record when stuck state started
+            # Reset progress tracking
+            self.last_path_position = None
+            self.last_path_progress_time = None
+
+            # Also increment failure count for the current frontier?
+            if self.current_target_frontier_id:
+                 failures = self.path_planning_failures.get(self.current_target_frontier_id, 0) + 1
+                 self.path_planning_failures[self.current_target_frontier_id] = failures
+                 rospy.logwarn(f"Agent {self.agent.agent_id}: Path stuck increments failure count for {self.current_target_frontier_id} to {failures}")
+                 if failures >= self.MAX_PATH_FAILURES:
+                      rospy.logwarn(f"Agent {self.agent.agent_id}: Max path failures ({self.MAX_PATH_FAILURES}) reached for {self.current_target_frontier_id} due to being stuck. Releasing claim.")
+                      self._release_claim(self.current_target_frontier_id)
+                      # Reset avoidance state after releasing claim?
+                      self.avoidance_state = 'none' 
+                      self.stuck_start_time = None
+            else:
+                 rospy.logwarn(f"Agent {self.agent.agent_id}: Path stuck but no current target frontier ID set.")
+                 # If no target, just reset avoidance state after jiggle completes.
+                 pass 
+
+    def _follow_path(self):
+        """Follow the current A* path using a simple P-controller."""
+        if not self.current_path or self.current_path_index >= len(self.current_path):
+            rospy.loginfo(f"Agent {self.agent.agent_id}: Reached end of path or no path.")
+            if self.current_target_frontier_id:
+                 rospy.loginfo(f"Agent {self.agent.agent_id}: Marking frontier {self.current_target_frontier_id} as explored.")
+                 self._mark_frontier_explored(self.current_target_frontier_id)
+                 self.current_target_frontier_id = None # Clear target after reaching
+                 # Reset path failure count on success
+                 self.path_planning_failures.pop(self.current_target_frontier_id, None)
+            self.current_path = None
+            self.current_path_index = 0
+            self._publish_current_path() # Publish empty path
+            return 0.0, 0.0
+
+        # Get current position and next waypoint in world coordinates
+        current_pos_world = self.agent.position[:2]
+        next_waypoint_grid = self.current_path[self.current_path_index]
+        next_waypoint_world = self._grid_to_world(next_waypoint_grid[0], next_waypoint_grid[1])
+
+        # Calculate vector and distance to the next waypoint
+        direction_vector = next_waypoint_world - current_pos_world
+        distance_to_waypoint = np.linalg.norm(direction_vector)
+
+        # Check if waypoint is reached
+        WAYPOINT_REACHED_THRESHOLD = self.cell_size # Adjust as needed
+        if distance_to_waypoint < WAYPOINT_REACHED_THRESHOLD:
+            rospy.logdebug(f"Agent {self.agent.agent_id}: Reached waypoint {self.current_path_index}/{len(self.current_path)-1} at grid {next_waypoint_grid}.")
+            self.current_path_index += 1
+            # Reset path progress check on reaching waypoint
+            self.last_path_position = None 
+            self.last_path_progress_time = None
+            # Check if this was the last waypoint
+            if self.current_path_index >= len(self.current_path):
+                rospy.loginfo(f"Agent {self.agent.agent_id}: Reached final waypoint of the path.")
+                # Final handling (marking frontier, etc.) done at start of next call
+                return 0.0, 0.0
+            else:
+                 # Get the *new* next waypoint for heading calculation
+                 next_waypoint_grid = self.current_path[self.current_path_index]
+                 next_waypoint_world = self._grid_to_world(next_waypoint_grid[0], next_waypoint_grid[1])
+                 direction_vector = next_waypoint_world - current_pos_world
+                 distance_to_waypoint = np.linalg.norm(direction_vector)
+
+
+        # Calculate desired heading
+        desired_heading = math.atan2(direction_vector[1], direction_vector[0])
+        current_heading = self.agent.get_yaw()
+        angular_diff = self._normalize_angle(desired_heading - current_heading)
+
+        # Simple P-controller for angular velocity
+        ANGULAR_P_GAIN = 1.5 # Tune this
+        angular_z = np.clip(angular_diff * ANGULAR_P_GAIN, -self.agent.max_angular_speed, self.max_angular_speed)
+
+        # Simple P-controller for linear velocity (reduce speed when turning)
+        LINEAR_P_GAIN = 0.8 # Tune this
+        # Reduce linear speed significantly if turning sharply
+        turn_reduction_factor = max(0.1, 1.0 - abs(angular_diff) / (math.pi / 2.0)) # Reduce more for >90deg turns
+        linear_x = np.clip(distance_to_waypoint * LINEAR_P_GAIN * turn_reduction_factor, 0.0, self.agent.max_linear_speed)
+
+        # Prevent oscillation: if angular error is large, prioritize turning
+        ANGLE_THRESHOLD_FOR_TURN_ONLY = np.deg2rad(30) # Tune this
+        if abs(angular_diff) > ANGLE_THRESHOLD_FOR_TURN_ONLY:
+            linear_x = 0.0 # Stop moving forward to turn more effectively
+
+        rospy.logdebug(f"Agent {self.agent.agent_id} PathFollow: Waypt={next_waypoint_grid}, Dist={distance_to_waypoint:.2f}, AngDiff={math.degrees(angular_diff):.1f}, LinX={linear_x:.2f}, AngZ={angular_z:.2f}")
+
+        # --- Add Potential Field steering if very close to obstacles --- #
+        # This provides a finer-grained avoidance than the state machine alone
+        # Check obstacles directly in front
+        min_obstacle_dist = float('inf')
+        # Use raw scan for this check?
+        ranges = self.agent.last_scan_ranges
+        angle_min = self.agent.last_scan_angle_min
+        angle_increment = self.agent.last_scan_angle_increment
+        forward_check_angle = np.deg2rad(15) # Check +/- 15 degrees
+
+        if ranges:
+            for i, r in enumerate(ranges):
+                if not np.isfinite(r) or r <= 0:
+                    continue
+                angle = angle_min + i * angle_increment
+                if abs(angle) < forward_check_angle:
+                     min_obstacle_dist = min(min_obstacle_dist, r)
+        
+        PF_CLOSE_THRESHOLD = 0.3 # Threshold to trigger PF override during path following
+        if min_obstacle_dist < PF_CLOSE_THRESHOLD:
+             rospy.logdebug_throttle(1.0, f"Agent {self.agent.agent_id}: PathFollow - Obstacle very close ({min_obstacle_dist:.2f}m < {PF_CLOSE_THRESHOLD:.2f}m). Using PF for immediate avoidance.")
+             # Calculate PF velocity, passing the direction to the next waypoint as the attraction vector
+             attraction = direction_vector # Use the already calculated vector to the next waypoint
+             pf_linear_x, pf_angular_z = self._calculate_potential_field_velocity(attraction_vector=attraction) 
+             # Blend with path following? Or just use PF?
+             # Let's just use PF when very close.
+             linear_x = pf_linear_x
+             angular_z = pf_angular_z
+             # Check if this close obstacle should trigger the full avoidance state
+             # Use a slightly larger threshold for state transition than the immediate PF override
+             if min_obstacle_dist < (PF_CLOSE_THRESHOLD + 0.1): 
+                 if self.avoidance_state == 'none': # Only transition if not already avoiding/recovering
+                     rospy.logwarn(f"Agent {self.agent.agent_id}: Obstacle detected ({min_obstacle_dist:.2f}m) during path following. Entering 'avoiding' state.")
+                     self.avoidance_state = 'avoiding'
+                     self.pf_avoid_start_time = rospy.Time.now()
+                     if self.stuck_start_time is None: # Start overall stuck timer
+                         self.stuck_start_time = self.pf_avoid_start_time
+                     # Stop motion immediately when entering state
+                     linear_x = 0.0
+                     angular_z = 0.0
+
+        return linear_x, angular_z
+
+    def _update_grid_callback(self, event):
+        """Timer callback to update the occupancy grid based on laser scan."""
+        if not self.agent.last_scan_ranges:
+            return # No scan data yet
+
+        # Get agent's current position in grid coordinates
+        try:
+            agent_pos_world = self.agent.position[:2]
+            agent_grid_x, agent_grid_y = self._world_to_grid(agent_pos_world[0], agent_pos_world[1])
+        except Exception as e:
+             rospy.logerr(f"Agent {self.agent.agent_id} _update_grid: Failed to get agent grid position: {e}")
+             return
+             
+        # Ensure agent position is within grid bounds
+        if not (0 <= agent_grid_x < self.grid_dims and 0 <= agent_grid_y < self.grid_dims):
+             rospy.logwarn_throttle(10, f"Agent {self.agent.agent_id} is outside the grid bounds! Cannot update grid.")
+             return
+
+        # Mark agent's current cell as free
+        self.grid[agent_grid_x, agent_grid_y] = GRID_FREE
+
+        # Get laser scan data (use stored data)
+        ranges = self.agent.last_scan_ranges
+        angle_min = self.agent.last_scan_angle_min
+        angle_increment = self.agent.last_scan_angle_increment
+        lookup_time = self.agent.last_scan_time # Use the timestamp from the scan
+
+        # Try to get the transform from laser frame to odom frame at the scan time
+        try:
+            # --- Increased Timeout --- #
+            transform = self.tf_buffer.lookup_transform(self.odom_frame, self.laser_frame, lookup_time, rospy.Duration(0.2)) # Increased from 0.1
+            # -----------------------
+            # --- DEBUG LOG --- #
+            rospy.logdebug(f"Agent {self.agent.agent_id} TF OK: Laser->Odom @ {lookup_time.to_sec():.3f}")
+            # --------------- #
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn_throttle(2.0, f"Agent {self.agent.agent_id} TF Fail (Scan Time): {e}. Retrying with Time(0)...")
+            # --- DEBUG LOG --- #
+            rospy.logwarn(f"Agent {self.agent.agent_id} DBG ScanCB TF Fail ScanTime: {e}")
+            # --------------- #
+            try:
+                # If first fails, wait briefly and try again with Time(0) as fallback
+                rospy.sleep(0.05) # Wait 50ms
+                lookup_time = rospy.Time(0) # Fallback to Time(0)
+                # --- Increased Timeout --- #
+                transform = self.tf_buffer.lookup_transform(self.odom_frame, self.laser_frame, lookup_time, rospy.Duration(0.2)) # Increased from 0.1
+                # -----------------------
+                # --- DEBUG LOG --- #
+                rospy.logdebug(f"Agent {self.agent.agent_id} TF OK: Laser->Odom @ Time(0)")
+                # --------------- #
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e2:
+                rospy.logerr_throttle(5.0, f"Agent {self.agent.agent_id} TF Fail (Time(0)): {e2}. Cannot update grid.")
+                # --- DEBUG LOG --- #
+                rospy.logerr(f"Agent {self.agent.agent_id} DBG ScanCB TF Fail Time(0): {e2}")
+                # --------------- #
+                return # Cannot proceed without transform
+
+        # Iterate through laser ranges
+        num_ranges = len(ranges)
+        for i in range(num_ranges):
+            r = ranges[i]
+            angle = angle_min + i * angle_increment
+
+            # Check for max range (invalid reading, typically)
+            is_max_range = (r >= self.agent.last_scan_range_max * 0.99) # Use slightly less than max
+            is_valid_range = (r > self.agent.last_scan_range_min and not is_max_range)
+
+            # Calculate the point in the laser frame
+            x_laser = r * math.cos(angle)
+            y_laser = r * math.sin(angle)
+
+            # Transform the point to the odom frame using the obtained transform
+            point_laser = PointStamped()
+            point_laser.header.stamp = lookup_time # Use the time corresponding to the transform
+            point_laser.header.frame_id = self.laser_frame
+            point_laser.point.x = x_laser
+            point_laser.point.y = y_laser
+            try:
+                point_odom = tf2_geometry_msgs.do_transform_point(point_laser, transform)
+                # ---> ADD CHECK FOR FINITE VALUES <--- #
+                if not np.isfinite(point_odom.point.x) or not np.isfinite(point_odom.point.y):
+                    rospy.logwarn_throttle(10.0, f"Agent {self.agent.agent_id} TF result is not finite ({point_odom.point.x}, {point_odom.point.y}). Skipping point {i}.")
+                    continue
+                # ---> END CHECK <--- #
+            except Exception as e_tf_point:
+                 rospy.logwarn(f"Agent {self.agent.agent_id} Point TF Fail: {e_tf_point}. Skipping point {i}")
+                 continue
+
+            # Convert world coordinates (odom) to grid coordinates
+            hit_grid_x, hit_grid_y = self._world_to_grid(point_odom.point.x, point_odom.point.y)
+
+            # Mark the line from agent to hit point using Bresenham's
+            # Mark cells as free up to the hit point (or max range)
+            # Ensure agent grid coords are valid before marking line
+            if 0 <= agent_grid_x < self.grid_dims and 0 <= agent_grid_y < self.grid_dims:
+                # Determine the end point for Bresenham's line
+                # If it's a max range reading, we trace further out
+                if is_max_range:
+                    max_range_dist = self.agent.last_scan_range_max + self.cell_size * 2 # Extend beyond max range
+                    x_laser_max = max_range_dist * math.cos(angle)
+                    y_laser_max = max_range_dist * math.sin(angle)
+                    point_laser_max = PointStamped()
+                    point_laser_max.header.stamp = lookup_time
+                    point_laser_max.header.frame_id = self.laser_frame
+                    point_laser_max.point.x = x_laser_max
+                    point_laser_max.point.y = y_laser_max
+                    try:
+                        point_odom_max = tf2_geometry_msgs.do_transform_point(point_laser_max, transform)
+                        end_grid_x, end_grid_y = self._world_to_grid(point_odom_max.point.x, point_odom_max.point.y)
+                    except Exception as e_tf_max:
+                         rospy.logwarn(f"Agent {self.agent.agent_id} Max Range Point TF Fail: {e_tf_max}. Using hit grid coords.")
+                         end_grid_x, end_grid_y = hit_grid_x, hit_grid_y
+                    # Mark line up to this extended point as free
+                    self._mark_line(agent_grid_x, agent_grid_y, end_grid_x, end_grid_y, mark_obstacle=False)
+                
+                elif is_valid_range:
+                    # Mark line up to the hit point as free, and mark the hit point itself as an obstacle
+                    self._mark_line(agent_grid_x, agent_grid_y, hit_grid_x, hit_grid_y, mark_obstacle=True)
+            else:
+                 # Should not happen based on check above, but log if it does
+                 rospy.logerr("Agent grid coordinates became invalid during scan processing!")
+
+        # --- Grid Inflation (Optional - Currently disabled by logic) --- #
+        # self._inflate_obstacles()
+
+    def _mark_line(self, x0, y0, x1, y1, mark_obstacle=False):
+        """Mark cells along a line using Bresenham's algorithm.
+           Marks cells as FREE (1). If mark_obstacle is True, the endpoint (x1, y1)
+           is marked as OBSTACLE (2) if it's within bounds.
+           Modified to clear obstacles back to free if ray passes through.
+        """
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy  # error value e_xy
+        count = 0 # Limit loop iterations for safety
+        max_count = self.grid_dims * 2 # Heuristic limit
+
+        x, y = x0, y0
+        while count < max_count:
+            # Check if current point (x, y) is the endpoint
+            is_endpoint = (x == x1 and y == y1)
+
+            # Check bounds before accessing grid
+            if 0 <= x < self.grid_dims and 0 <= y < self.grid_dims:
+                current_state = self.grid[x, y]
+                
+                # If this is the endpoint AND we should mark obstacles:
+                if is_endpoint and mark_obstacle:
+                    if current_state != GRID_OBSTACLE:
+                        rospy.logdebug(f"Marking OBSTACLE at ({x},{y}). Prev state: {current_state}")
+                        self.grid[x, y] = GRID_OBSTACLE
+                    break # Stop after marking the obstacle endpoint
+                else:
+                    # Mark intermediate cells or non-obstacle endpoints as FREE
+                    # Only mark if currently UNKNOWN (0) or OBSTACLE (2)
+                    # Do NOT overwrite INFLATED (3) cells back to FREE
+                    if current_state == GRID_UNKNOWN or current_state == GRID_OBSTACLE:
+                         rospy.logdebug(f"Marking FREE at ({x},{y}). Prev state: {current_state}")
+                         self.grid[x, y] = GRID_FREE
+
+            # If we reached the endpoint (and didn't mark it as obstacle), break
+            if is_endpoint:
+                break
+
+            # Bresenham's algorithm steps
+            e2 = 2 * err
+            if e2 >= dy: # e_xy+e_x > 0
+                err += dy
+                x += sx
+            if e2 <= dx: # e_xy+e_y < 0
+                err += dx
+                y += sy
+            count += 1
+        
+        if count >= max_count:
+            rospy.logwarn("_mark_line loop limit reached! Potential infinite loop detected.")
+
+    # --- Obstacle Inflation (Keep function, but not called by default) --- #
+    def _inflate_obstacles(self):
+        """Inflate obstacles in the grid map."""
+        if self.inflation_radius_cells <= 0:
+            return
+
+        rows, cols = self.grid.shape
+        inflated_grid = self.grid.copy()
+        obstacle_indices = np.argwhere(self.grid == GRID_OBSTACLE)
+
+        for r_obs, c_obs in obstacle_indices:
+            for r_inflate in range(-self.inflation_radius_cells, self.inflation_radius_cells + 1):
+                for c_inflate in range(-self.inflation_radius_cells, self.inflation_radius_cells + 1):
+                    # Check Euclidean distance for circular inflation
+                    if r_inflate**2 + c_inflate**2 <= self.inflation_radius_cells**2:
+                        r, c = r_obs + r_inflate, c_obs + c_inflate
+                        # Check bounds and if the cell isn't already an obstacle
+                        if 0 <= r < rows and 0 <= c < cols and self.grid[r, c] != GRID_OBSTACLE:
+                            inflated_grid[r, c] = GRID_INFLATED # Mark as inflated
+
+        self.grid = inflated_grid
+
+    # --- World <-> Grid Conversion --- #
+    def _world_to_grid(self, world_x, world_y):
+        """Convert world coordinates to grid indices."""
+        grid_x = int((world_x - self.grid_origin_offset[0]) / self.cell_size)
+        grid_y = int((world_y - self.grid_origin_offset[1]) / self.cell_size)
+        return grid_x, grid_y
+
+    def _grid_to_world(self, grid_x, grid_y):
+        """Convert grid indices to world coordinates (center of the cell)."""
+        world_x = self.grid_origin_offset[0] + (grid_x + 0.5) * self.cell_size
+        world_y = self.grid_origin_offset[1] + (grid_y + 0.5) * self.cell_size
+        return np.array([world_x, world_y])
+
+    # --- Frontier Detection and Handling --- #
+    def _detect_local_frontiers(self):
+        """Detect frontiers in the local grid map."""
+        frontier_clusters = []
+        visited_frontier_cells = set()
+        rows, cols = self.grid.shape
+
+        for r in range(rows):
+            for c in range(cols):
+                # Check if current cell is free and not yet part of a cluster
+                if self.grid[r, c] == GRID_FREE and (r, c) not in visited_frontier_cells:
+                    is_frontier_cell = False
+                    # Check 4-connectivity neighbors for unknown cells
+                    for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < rows and 0 <= nc < cols and self.grid[nr, nc] == GRID_UNKNOWN:
+                            is_frontier_cell = True
+                            break
+                    
+                    # If it's a frontier cell, start BFS to find the cluster
+                    if is_frontier_cell:
+                        current_cluster = []
+                        q = collections.deque([(r, c)])
+                        cluster_visited = {(r,c)}
+                        visited_frontier_cells.add((r,c)) # Mark as visited for overall detection
+
+                        while q:
+                            curr_r, curr_c = q.popleft()
+                            
+                            # Check if this cell is indeed a frontier cell itself
+                            is_curr_frontier = False
+                            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                                 nr, nc = curr_r + dr, curr_c + dc
+                                 if 0 <= nr < rows and 0 <= nc < cols and self.grid[nr, nc] == GRID_UNKNOWN:
+                                     is_curr_frontier = True
+                                     break
+                            
+                            # Only add actual frontier cells to the cluster
+                            if is_curr_frontier:
+                                current_cluster.append((curr_r, curr_c))
+
+                                # Find neighboring FREE cells that are also frontiers for clustering
+                                # Use 8-connectivity for clustering frontiers
+                                for dr_c, dc_c in [(0,1), (0,-1), (1,0), (-1,0), (1,1), (1,-1), (-1,1), (-1,-1)]:
+                                    nr_c, nc_c = curr_r + dr_c, curr_c + dc_c
+                                    # Check bounds, ensure it's FREE, and not visited in this cluster search
+                                    if (0 <= nr_c < rows and 0 <= nc_c < cols and 
+                                        self.grid[nr_c, nc_c] == GRID_FREE and 
+                                        (nr_c, nc_c) not in cluster_visited):
+                                        
+                                        # Check if this neighbor is ALSO a frontier cell (borders unknown)
+                                        is_neighbor_frontier = False
+                                        for dr_n, dc_n in [(0,1), (0,-1), (1,0), (-1,0)]:
+                                            nr_n, nc_n = nr_c + dr_n, nc_c + dc_n
+                                            if 0 <= nr_n < rows and 0 <= nc_n < cols and self.grid[nr_n, nc_n] == GRID_UNKNOWN:
+                                                is_neighbor_frontier = True
+                                                break
+                                        
+                                        if is_neighbor_frontier:
+                                             q.append((nr_c, nc_c))
+                                             cluster_visited.add((nr_c, nc_c))
+                                             visited_frontier_cells.add((nr_c, nc_c)) # Mark globally visited
+
+                        if current_cluster: # Only add non-empty clusters
+                             frontier_clusters.append(current_cluster)
+        
+        # Process clusters into frontier data dictionaries
+        new_frontiers = []
+        MIN_FRONTIER_SIZE = 3 # Minimum number of cells to be considered a valid frontier
+        for cluster in frontier_clusters:
+            if len(cluster) >= MIN_FRONTIER_SIZE:
+                centroid_grid = np.mean(cluster, axis=0).round().astype(int)
+                # centroid_world = self._grid_to_world(centroid_grid[0], centroid_grid[1]) # Call grid_to_world
+                try:
+                    centroid_world_val = self._grid_to_world(centroid_grid[0], centroid_grid[1])
+                except Exception as e_gw:
+                     rospy.logerr(f"Agent {self.agent.agent_id}: Error in _grid_to_world({centroid_grid[0]}, {centroid_grid[1]}): {e_gw}")
+                     centroid_world_val = None # Handle potential errors in conversion
+
+                # Ensure centroid_world is stored as a list for JSON compatibility
+                if isinstance(centroid_world_val, np.ndarray):
+                    centroid_world_list = centroid_world_val.tolist()
+                elif isinstance(centroid_world_val, (list, tuple)) and len(centroid_world_val) >= 2:
+                    # If it's already a list or tuple (like the error suggested), ensure it's a list
+                    centroid_world_list = list(centroid_world_val)[:2] # Take first 2 elements as list
+                else:
+                    # Log an error if it's None or an unexpected type/format
+                    rospy.logerr(f"Agent {self.agent.agent_id} FrontierDetect: _grid_to_world returned invalid value {centroid_world_val} (type: {type(centroid_world_val)}) for grid {centroid_grid}. Using default [0,0].")
+                    centroid_world_list = [0.0, 0.0] # Default value
+
+                # Create a unique ID based on centroid world coordinates
+                # Use the safe list version for ID generation
+                frontier_id = f"fx_{centroid_world_list[0]:.1f}_{centroid_world_list[1]:.1f}"
+                
+                # Create frontier data dictionary
+                frontier_data = {
+                    'id': frontier_id,
+                    'centroid_world': centroid_world_list, # Use the converted list
+                    'centroid_grid': centroid_grid.tolist(), # centroid_grid is ndarray
+                    'size': len(cluster),
+                    'status': 'open', # 'open', 'claimed', 'explored'
+                    'claimant_agent_id': -1, # ID of the agent claiming/exploring it
+                    'discovered_by': self.agent.agent_id,
+                    'last_updated': rospy.Time.now().to_sec()
+                }
+                new_frontiers.append(frontier_data)
+
+        rospy.logdebug(f"Agent {self.agent.agent_id}: Detected {len(new_frontiers)} new local frontiers.")
+        return new_frontiers
+
+    def _publish_frontiers_callback(self, event):
+        """Timer callback to detect and publish local frontiers."""
+        local_frontiers = self._detect_local_frontiers()
+        published_count = 0
+        for frontier in local_frontiers:
+            fid = frontier['id']
+            # Publish only if it's new or significantly changed (e.g., size, maybe status if locally marked explored?)
+            # For simplicity, let's republish if known status is different or size changed
+            # Or just publish if not 'explored'?
+            should_publish = False
+            if fid not in self.known_frontiers:
+                 should_publish = True
+                 # Add to known frontiers immediately
+                 self.known_frontiers[fid] = frontier 
+            else:
+                 # Update existing entry
+                 # Only update if status is not 'explored' by someone else
+                 # And if our local info seems more up-to-date (e.g., status changes)
+                 current_known = self.known_frontiers[fid]
+                 if current_known.get('status','open') != 'explored':
+                    # Update size, maybe status if we locally determined it changed
+                    # Keep claimant info unless we are releasing
+                    current_known['size'] = frontier['size'] # Update size
+                    current_known['last_updated'] = frontier['last_updated']
+                    # Don't overwrite status/claimant unless we are the source of change
+                    # (e.g., self._release_claim or self._mark_frontier_explored)
+                    should_publish = True # Republish updated info
+                 else:
+                     # If already marked explored globally, don't republish unless we somehow reopened it
+                     pass 
+            
+            if should_publish:
+                self.agent.share_data('frontiers', frontier) # Publish via comm module
+                published_count += 1
+        
+        if published_count > 0:
+             rospy.loginfo(f"Agent {self.agent.agent_id}: Published {published_count} new/updated local frontiers.")
+        else:
+             rospy.logdebug(f"Agent {self.agent.agent_id}: No new/updated local frontiers to publish.")
+
+    def frontier_update_callback(self, data):
+        """Callback for receiving frontier updates from other agents."""
+        frontier_id = data.get('id')
+        sender_id = data.get('agent_id')
+        if not frontier_id or sender_id == self.agent.agent_id:
+            return
+
         # Movement parameters (could be tuned differently from Search)
         self.max_linear_speed = 1.2
         self.max_angular_speed = 1.5
@@ -109,7 +803,9 @@ class ExploreBehaviour:
         self.MIN_PROGRESS_DIST = self.cell_size * 0.5 # Min distance moved to count as progress
 
         # TF listener for transforming points
-        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(30.0))
+        # --- Increased Cache Time --- #
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(60.0)) # Increased from 30.0
+        # -------------------------- #
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.odom_frame = f"{self.agent.agent_name}/odom" # Correct odom frame name
         self.laser_frame = f"{self.agent.agent_name}/laser" # Correct laser frame name
@@ -177,6 +873,15 @@ class ExploreBehaviour:
 
     def compute(self):
         """Compute movement commands for exploration."""
+        # === Initial State Debug Logging START ===
+        try:
+            agent_grid_x, agent_grid_y = self._world_to_grid(self.agent.position[0], self.agent.position[1])
+            current_cell_state = self.grid[agent_grid_x, agent_grid_y]
+            rospy.logdebug(f"Agent {self.agent.agent_id} Compute Start: Pos=({self.agent.position[0]:.2f},{self.agent.position[1]:.2f}), Grid=({agent_grid_x},{agent_grid_y}), GridState={current_cell_state}")
+        except Exception as e:
+            rospy.logwarn(f"Agent {self.agent.agent_id} Compute Start: Error getting initial grid state: {e}")
+        # === Initial State Debug Logging END ===
+            
         # If already marked as complete, just stop
         # Use a flag to signal immediate stop requested by timeout logic
         stop_exploration_requested = False
@@ -443,7 +1148,7 @@ class ExploreBehaviour:
         return final_linear_x, final_angular_z # Ensure final values are returned
 
     # --- Potential Field Calculation ---
-    def _calculate_potential_field_velocity(self):
+    def _calculate_potential_field_velocity(self, attraction_vector=None):
         """Calculates desired velocity based on repulsive forces from laser scan and a default attractive force."""
         ranges = self.agent.last_scan_ranges
         if not ranges:
@@ -518,7 +1223,7 @@ class ExploreBehaviour:
         """Convert grid indices to world coordinates (center of cell)."""
         world_x = grid_x * self.cell_size - self.map_size / 2 + self.cell_size / 2
         world_y = grid_y * self.cell_size - self.map_size / 2 + self.cell_size / 2
-        return world_x, world_y
+        return np.array([world_x, world_y])
 
     def _get_euler_from_quaternion(self):
         """Helper to get yaw from agent's orientation."""
@@ -549,7 +1254,9 @@ class ExploreBehaviour:
         transform = None
         try:
             # First attempt to lookup transform using scan time
-            transform = self.tf_buffer.lookup_transform(self.odom_frame, self.laser_frame, lookup_time, rospy.Duration(0.1))
+            # --- Increased Timeout --- #
+            transform = self.tf_buffer.lookup_transform(self.odom_frame, self.laser_frame, lookup_time, rospy.Duration(0.2)) # Increased from 0.1
+            # -----------------------
             # --- DEBUG LOG --- #
             # Log transform details if successful
             tx = transform.transform.translation.x
@@ -563,56 +1270,86 @@ class ExploreBehaviour:
                 # If first fails, wait briefly and try again with Time(0) as fallback
                 rospy.sleep(0.05) # Wait 50ms
                 lookup_time = rospy.Time(0) # Fallback to Time(0)
-                transform = self.tf_buffer.lookup_transform(self.odom_frame, self.laser_frame, lookup_time, rospy.Duration(0.1))
+                # --- Increased Timeout --- #
+                transform = self.tf_buffer.lookup_transform(self.odom_frame, self.laser_frame, lookup_time, rospy.Duration(0.2)) # Increased from 0.1
+                # -----------------------
                 # --- DEBUG LOG --- #
-                # Log transform details if successful
-                tx = transform.transform.translation.x
-                ty = transform.transform.translation.y
-                rz = tf.transformations.euler_from_quaternion([transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z, transform.transform.rotation.w])[2]
-                rospy.logdebug(f"Agent {self.agent.agent_id} DBG GridUpdate TF: Using transform Odom<-Laser @ time {lookup_time.to_sec():.3f}. Trans=({tx:.2f},{ty:.2f}), RotZ={np.rad2deg(rz):.1f}deg")
-                # --- End DEBUG --- #
+                rospy.logdebug(f"Agent {self.agent.agent_id} TF OK: Laser->Odom @ Time(0)")
+                # --------------- #
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e2:
-                 # If retry also fails, log final warning and return
-                 rospy.logwarn_throttle(5, f"Agent {self.agent.agent_id}: TF Lookup failed (2nd try - Time(0)): {e2}. Skipping grid update this cycle.")
-                 return # Give up for this cycle
-            
-        # If transform lookup succeeded (either first or second try)
-        agent_pos_grid = (agent_grid_x, agent_grid_y)
-        # Process scan ranges using the obtained transform
-        for i, r in enumerate(ranges):
-            # === DEBUG LOGGING START ===
-            log_this_point = False # Flag to log details for specific points if needed (e.g., near agent)
-            angle = angle_min + i * angle_increment; x_laser = r * np.cos(angle); y_laser = r * np.sin(angle)
-            # --- Use scan_time (if valid) for PointStamped header --- #
-            point_laser = PointStamped()
-            point_laser.header.stamp = scan_time if scan_time else rospy.Time.now()
-            point_laser.header.frame_id = self.laser_frame
-            # ------------------------------------------------------ #
-            try:
-                if min_range < r < max_range:
-                    point_laser.point.x = x_laser; point_laser.point.y = y_laser
-                    point_odom = self.tf_buffer.transform(point_laser, self.odom_frame, timeout=rospy.Duration(0.1)) 
-                    obs_grid_x, obs_grid_y = self._world_to_grid(point_odom.point.x, point_odom.point.y)
-                    if (obs_grid_x, obs_grid_y) != agent_pos_grid: 
-                        # === DEBUG LOGGING ===
-                        # Log all obstacle markings
-                        log_this_point = True
-                        rospy.logdebug(f"Agent {self.agent.agent_id} DBG GridUpdate Obstacle: Marking obstacle at grid ({obs_grid_x},{obs_grid_y}) from world ({point_odom.point.x:.2f},{point_odom.point.y:.2f}). Laser index {i}.")
-                        # ====================
-                        self.grid[obs_grid_x, obs_grid_y] = 2
-                    self._mark_line(agent_grid_x, agent_grid_y, obs_grid_x, obs_grid_y, False, False)
-                elif r >= max_range:
-                     point_laser.point.x = max_range * np.cos(angle); point_laser.point.y = max_range * np.sin(angle)
-                     point_odom = self.tf_buffer.transform(point_laser, self.odom_frame, timeout=rospy.Duration(0.1)) 
-                     max_grid_x, max_grid_y = self._world_to_grid(point_odom.point.x, point_odom.point.y)
-                     self._mark_line(agent_grid_x, agent_grid_y, max_grid_x, max_grid_y, False, True)
-            # Catch errors during point transformation or grid marking
-            except Exception as e: rospy.logwarn_throttle(10, f"Agent {self.agent.agent_id}: Error processing scan point {i}: {e}")
+                rospy.logerr_throttle(5.0, f"Agent {self.agent.agent_id} TF Fail (Time(0)): {e2}. Cannot update grid.")
+                # --- DEBUG LOG --- #
+                rospy.logerr(f"Agent {self.agent.agent_id} DBG ScanCB TF Fail Time(0): {e2}")
+                # --------------- #
+                return # Cannot proceed without transform
 
-        # --- After processing scan, inflate obstacles --- #
-        # --- Disabled inflation by setting radius to 0 --- #
-        self._inflate_obstacles(inflation_radius_cells=0) # Was 1
-        # --------------------------------------------- #
+        # Iterate through laser ranges
+        num_ranges = len(ranges)
+        for i in range(num_ranges):
+            r = ranges[i]
+            angle = angle_min + i * angle_increment
+
+            # Check for max range (invalid reading, typically)
+            is_max_range = (r >= self.agent.last_scan_range_max * 0.99) # Use slightly less than max
+            is_valid_range = (r > self.agent.last_scan_range_min and not is_max_range)
+
+            # Calculate the point in the laser frame
+            x_laser = r * math.cos(angle)
+            y_laser = r * math.sin(angle)
+
+            # Transform the point to the odom frame using the obtained transform
+            point_laser = PointStamped()
+            point_laser.header.stamp = lookup_time # Use the time corresponding to the transform
+            point_laser.header.frame_id = self.laser_frame
+            point_laser.point.x = x_laser
+            point_laser.point.y = y_laser
+            try:
+                point_odom = tf2_geometry_msgs.do_transform_point(point_laser, transform)
+                # ---> ADD CHECK FOR FINITE VALUES <--- #
+                if not np.isfinite(point_odom.point.x) or not np.isfinite(point_odom.point.y):
+                    rospy.logwarn_throttle(10.0, f"Agent {self.agent.agent_id} TF result is not finite ({point_odom.point.x}, {point_odom.point.y}). Skipping point {i}.")
+                    continue
+                # ---> END CHECK <--- #
+            except Exception as e_tf_point:
+                 rospy.logwarn(f"Agent {self.agent.agent_id} Point TF Fail: {e_tf_point}. Skipping point {i}")
+                 continue
+
+            # Convert world coordinates (odom) to grid coordinates
+            hit_grid_x, hit_grid_y = self._world_to_grid(point_odom.point.x, point_odom.point.y)
+
+            # Mark the line from agent to hit point using Bresenham's
+            # Mark cells as free up to the hit point (or max range)
+            # Ensure agent grid coords are valid before marking line
+            if 0 <= agent_grid_x < self.grid_dims and 0 <= agent_grid_y < self.grid_dims:
+                # Determine the end point for Bresenham's line
+                # If it's a max range reading, we trace further out
+                if is_max_range:
+                    max_range_dist = self.agent.last_scan_range_max + self.cell_size * 2 # Extend beyond max range
+                    x_laser_max = max_range_dist * math.cos(angle)
+                    y_laser_max = max_range_dist * math.sin(angle)
+                    point_laser_max = PointStamped()
+                    point_laser_max.header.stamp = lookup_time
+                    point_laser_max.header.frame_id = self.laser_frame
+                    point_laser_max.point.x = x_laser_max
+                    point_laser_max.point.y = y_laser_max
+                    try:
+                        point_odom_max = tf2_geometry_msgs.do_transform_point(point_laser_max, transform)
+                        end_grid_x, end_grid_y = self._world_to_grid(point_odom_max.point.x, point_odom_max.point.y)
+                    except Exception as e_tf_max:
+                         rospy.logwarn(f"Agent {self.agent.agent_id} Max Range Point TF Fail: {e_tf_max}. Using hit grid coords.")
+                         end_grid_x, end_grid_y = hit_grid_x, hit_grid_y
+                    # Mark line up to this extended point as free
+                    self._mark_line(agent_grid_x, agent_grid_y, end_grid_x, end_grid_y, mark_obstacle=False)
+                
+                elif is_valid_range:
+                    # Mark line up to the hit point as free, and mark the hit point itself as an obstacle
+                    self._mark_line(agent_grid_x, agent_grid_y, hit_grid_x, hit_grid_y, mark_obstacle=True)
+            else:
+                 # Should not happen based on check above, but log if it does
+                 rospy.logerr("Agent grid coordinates became invalid during scan processing!")
+
+        # --- Grid Inflation (Optional - Currently disabled by logic) --- #
+        # self._inflate_obstacles()
 
     def _inflate_obstacles(self, inflation_radius_cells=2):
         """Inflate obstacles on the grid by marking nearby cells with a higher cost."""
@@ -661,9 +1398,12 @@ class ExploreBehaviour:
         if inflated_count > 0:
              rospy.logdebug(f"Agent {self.agent.agent_id}: Inflated {inflated_count} cells around obstacles.")
 
-    def _mark_line(self, x0, y0, x1, y1, mark_endpoint_obstacle=False, endpoint_inclusive=True):
+    def _mark_line(self, x0, y0, x1, y1, mark_obstacle=False):
         """Mark cells on line as free (1), optionally handle endpoint."""
-        dx = abs(x1 - x0); dy = abs(y1 - y0); sx = 1 if x0 < x1 else -1; sy = 1 if y0 < y1 else -1
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
         err = dx - dy; x, y = x0, y0
         while True:
             # === DEBUG LOGGING START ===
@@ -674,12 +1414,16 @@ class ExploreBehaviour:
             is_endpoint = (x == x1 and y == y1); mark_this_cell = True
             if is_endpoint and not endpoint_inclusive: mark_this_cell = False
             if mark_this_cell and (0 <= x < self.grid_dims and 0 <= y < self.grid_dims):
-                 # --- Ensure only Unknown (0) is marked Free (1) ---
-                 if self.grid[x, y] == 0: 
+                 # --- Allow overwriting Unknown (0) OR Obstacle (2) with Free (1) ---
+                 # This corrects for cases where a previous obstacle detection was incorrect/transient
+                 if self.grid[x, y] in [0, 2]: 
                     if log_this_cell:
-                        rospy.logdebug(f"Agent {self.agent.agent_id} DBG MarkLine Free: Marking FREE at grid ({x},{y}) along line from ({x0},{y0}) to ({x1},{y1})")
+                        rospy.logdebug(f"Agent {self.agent.agent_id} DBG MarkLine Free: Marking FREE at grid ({x},{y}) along line from ({x0},{y0}) to ({x1},{y1}). Prev state={self.grid[x, y]}")
                     self.grid[x, y] = 1
-                 # ----------------------------------------------------
+                 # --- Keep Inflated (3) as Inflated --- 
+                 # elif self.grid[x, y] == 3: 
+                 #    pass # Don't overwrite inflated cells with free space from ray tracing
+                 # -----------------------------------------------------------------
             if is_endpoint: break
             e2 = 2 * err; 
             if e2 > -dy: err -= dy; x += sx
@@ -918,8 +1662,14 @@ class ExploreBehaviour:
             visited = {original_goal_node}
             nearest_valid_neighbor = None
             min_dist_found = float('inf')
-            BFS_LIMIT = 100 # Limit search depth/iterations to prevent excessive search
+            # --- Increased BFS limit for finding neighbors --- #
+            BFS_LIMIT = 500 # Increased limit from 250
+            # ------------------------------------------------- #
             bfs_count = 0
+ 
+            # --- Log start of neighbor BFS --- #
+            rospy.logdebug(f"Agent {self.agent.agent_id} A* NeighborBFS: Starting search for valid neighbor near obstacle goal {original_goal_node} with limit {BFS_LIMIT}")
+            # --------------------------------- #
 
             while q and bfs_count < BFS_LIMIT:
                 current_node, dist = q.popleft()
@@ -951,7 +1701,9 @@ class ExploreBehaviour:
                 rospy.loginfo(f"Agent {self.agent.agent_id} A*: Redirecting goal from {original_goal_node} to nearest valid neighbor {nearest_valid_neighbor} found via BFS.")
                 goal_node = nearest_valid_neighbor # Update the goal for A*
             else:
-                rospy.logerr(f"Agent {self.agent.agent_id} A*: Original goal {original_goal_node} is obstacle/inflated, and BFS within limit {BFS_LIMIT} found no valid neighbors. Pathfinding failed.")
+                # --- Log BFS failure reason --- #
+                rospy.logerr(f"Agent {self.agent.agent_id} A* NeighborBFS Fail: Original goal {original_goal_node} is obstacle/inflated, and BFS within limit {BFS_LIMIT} explored {bfs_count} nodes without finding valid neighbors. Pathfinding failed.")
+                # ------------------------------ #
                 return None, float('inf') # Cannot find any valid target nearby
         # --- End Obstacle Goal Handling --- #
 
@@ -961,7 +1713,9 @@ class ExploreBehaviour:
              return None, float('inf')
 
         # --- Add Reachability Check --- #
-        if not self._is_reachable(start_node, goal_node):
+        # --- Increased BFS Limit --- #
+        if not self._is_reachable(start_node, goal_node, limit=2000): # Increased limit from 1000
+        # -------------------------- #
             rospy.logwarn(f"Agent {self.agent.agent_id} A*: Goal {goal_node} determined unreachable from {start_node} via pre-check BFS. Pathfinding aborted.")
             return None, float('inf')
         # --- End Reachability Check --- #
@@ -1259,6 +2013,7 @@ class ExploreBehaviour:
                 self.stuck_start_time = None # Ensure overall stuck timer is reset after successful recovery
                 linear_x, angular_z = 0.0, 0.0 # Stop
         
+        # --- Unknown State ---
         else:
             rospy.logerr(f"Agent {self.agent.agent_id}: Unknown recovery state: {self.recovery_state}. Aborting recovery.")
             self.avoidance_state = 'none'
@@ -1296,11 +2051,15 @@ class ExploreBehaviour:
              rospy.logwarn(f"Agent {self.agent.agent_id}: Tried to release claim on non-existent or None frontier: {frontier_id}")
 
     # --- Add Reachability Check Method --- #
-    def _is_reachable(self, start_grid, goal_grid, limit=500):
+    def _is_reachable(self, start_grid, goal_grid, limit=2000): # Changed default limit
         """Check reachability using a limited BFS on the current grid."""
         rows, cols = self.grid.shape
         start_node = tuple(start_grid)
         goal_node = tuple(goal_grid)
+        
+        # --- Log BFS parameters --- #
+        rospy.logdebug(f"Agent {self.agent.agent_id} Reachability Check: Start={start_node}, Goal={goal_node}, Limit={limit}")
+        # -------------------------- #
 
         # Quick check if start or goal are invalid themselves
         if not (0 <= start_node[0] < rows and 0 <= start_node[1] < cols and self.grid[start_node] not in [2, 3]):
@@ -1337,6 +2096,385 @@ class ExploreBehaviour:
                     visited.add(neighbor)
                     q.append(neighbor)
 
-        rospy.logdebug(f"Agent {self.agent.agent_id} Reachability: Goal {goal_node} NOT reachable from {start_node} within BFS limit {limit}. Explored {count} nodes.")
+        # --- Log BFS failure details --- #
+        rospy.logdebug(f"Agent {self.agent.agent_id} Reachability Fail: Goal {goal_node} NOT reachable from {start_node} within BFS limit {limit}. Explored {count} nodes.") # Use limit parameter in log
+        # ------------------------------- #
         return False
     # --- End Reachability Check Method --- #
+
+    # --- Visualization --- #
+    def _visualization_callback(self, event):
+        """Timer callback to publish visualization markers."""
+        self._publish_grid()
+        self._publish_frontiers()
+        # Path is published when planned or cleared
+
+    def _publish_grid(self):
+        """Publish the current grid map as visualization markers."""
+        marker = Marker()
+        marker.header.frame_id = self.odom_frame # Publish grid in odom frame
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = f"agent_{self.agent.agent_id}_grid"
+        marker.id = 0
+        marker.type = Marker.CUBE_LIST
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = self.cell_size
+        marker.scale.y = self.cell_size
+        marker.scale.z = 0.01 # Flat cubes
+
+        marker.points = []
+        marker.colors = []
+        # Import ColorRGBA if not already imported at top level
+        from std_msgs.msg import ColorRGBA # Add this import inside if needed
+
+        rows, cols = self.grid.shape
+        for r in range(rows):
+            for c in range(cols):
+                state = self.grid[r, c]
+                if state != GRID_UNKNOWN: # Don't visualize unknown cells
+                    point = Point()
+                    world_coords = self._grid_to_world(r, c)
+                    point.x = world_coords[0]
+                    point.y = world_coords[1]
+                    point.z = -0.1 # Slightly below agent
+                    marker.points.append(point)
+
+                    color = ColorRGBA()
+                    color.a = 0.5 # Semi-transparent
+                    if state == GRID_FREE:
+                        color.r = 0.0; color.g = 1.0; color.b = 0.0 # Green for free
+                    elif state == GRID_OBSTACLE:
+                        color.r = 1.0; color.g = 0.0; color.b = 0.0 # Red for obstacle
+                    elif state == GRID_INFLATED:
+                        color.r = 1.0; color.g = 0.5; color.b = 0.0 # Orange for inflated
+                    marker.colors.append(color)
+        
+        if marker.points:
+             self.grid_pub.publish(marker)
+
+    def _publish_current_path(self):
+        """Publish the current path as a line strip marker."""
+        marker = Marker()
+        marker.header.frame_id = self.odom_frame
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = f"agent_{self.agent.agent_id}_path"
+        marker.id = 0
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.05 # Line width
+        from std_msgs.msg import ColorRGBA # Import ColorRGBA if not already imported
+        from geometry_msgs.msg import Point # Import Point if not already imported
+        marker.color = ColorRGBA(r=0.0, g=0.0, b=1.0, a=1.0) # Blue path
+
+        marker.points = []
+        if self.current_path:
+            # Add agent's current position as the start
+            current_world_pos = self.agent.position
+            start_point = Point()
+            start_point.x = current_world_pos[0]
+            start_point.y = current_world_pos[1]
+            start_point.z = 0.0 # Assume path is planar
+            marker.points.append(start_point)
+            # Add waypoints
+            # Iterate from current index if following, otherwise show full path
+            start_idx = self.current_path_index if self.current_path_index < len(self.current_path) else 0
+            for grid_node in self.current_path[start_idx:]:
+                if not isinstance(grid_node, (list, tuple)) or len(grid_node) != 2:
+                    rospy.logwarn_throttle(5.0, f"Agent {self.agent.agent_id} PathViz: Invalid point {grid_node} in path.")
+                    continue # Skip invalid points
+                try:
+                    waypoint_world = self._grid_to_world(grid_node[0], grid_node[1])
+                    p = Point()
+                    p.x = waypoint_world[0]
+                    p.y = waypoint_world[1]
+                    p.z = 0.0
+                    marker.points.append(p)
+                except IndexError:
+                    rospy.logwarn_throttle(5.0, f"Agent {self.agent.agent_id} PathViz: Grid node {grid_node} out of bounds.")
+        else:
+            # If no path, publish an empty marker to clear previous path in RViz
+             marker.action = Marker.DELETE # Or publish empty point list
+
+        self.path_pub.publish(marker)
+
+    def _publish_frontiers(self):
+        """Publish known frontiers as markers."""
+        marker_array = MarkerArray()
+        now = rospy.Time.now()
+        marker_id_counter = 0
+        # Import ColorRGBA if not already imported
+        from std_msgs.msg import ColorRGBA
+        from geometry_msgs.msg import Point # Import Point if needed
+
+        for fid, fdata in self.known_frontiers.items():
+            # Check if centroid_world exists and is valid
+            centroid = fdata.get('centroid_world')
+            if not isinstance(centroid, (list, tuple)) or len(centroid) < 2:
+                 rospy.logwarn_throttle(10.0, f"Agent {self.agent.agent_id} FrontierViz: Invalid centroid {centroid} for frontier {fid}. Skipping.")
+                 continue
+                 
+            marker = Marker()
+            marker.header.frame_id = self.odom_frame
+            marker.header.stamp = now
+            marker.ns = f"agent_{self.agent.agent_id}_frontiers"
+            marker.id = marker_id_counter
+            marker_id_counter += 1
+            marker.type = Marker.SPHERE # Represent frontier centroid as sphere
+            marker.action = Marker.ADD
+            marker.pose.position.x = centroid[0]
+            marker.pose.position.y = centroid[1]
+            marker.pose.position.z = 0.1 # Slightly above ground
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.3
+            marker.scale.y = 0.3
+            marker.scale.z = 0.3
+            marker.lifetime = rospy.Duration(2.5) # Match publish rate + buffer
+
+            status = fdata.get('status', 'open')
+            color = ColorRGBA(a=0.8)
+            if status == 'open':
+                color.r = 1.0; color.g = 1.0; color.b = 0.0 # Yellow
+            elif status == 'claimed':
+                color.r = 0.0; color.g = 1.0; color.b = 1.0 # Cyan
+                # Optionally color based on claimant ID?  # Correct indentation
+                claimant = fdata.get('claimant_agent_id', -1) # Correct indentation
+                if claimant == self.agent.agent_id:
+                     # Maybe make own claimed frontiers slightly different?
+                     color.b = 0.7 # Correct indentation
+            elif status == 'explored':
+                color.r = 0.5; color.g = 0.5; color.b = 0.5 # Grey
+            marker.color = color
+            marker_array.markers.append(marker)
+            
+            # Add text marker for Frontier ID
+            text_marker = Marker()
+            text_marker.header.frame_id = self.odom_frame
+            text_marker.header.stamp = now
+            text_marker.ns = f"agent_{self.agent.agent_id}_frontier_ids"
+            text_marker.id = marker_id_counter # Use different ID
+            marker_id_counter += 1
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+            text_marker.pose.position.x = centroid[0]
+            text_marker.pose.position.y = centroid[1]
+            text_marker.pose.position.z = 0.3 # Above sphere
+            text_marker.scale.z = 0.15 # Text height
+            text_marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+            text_marker.text = fid # Display the frontier ID
+            text_marker.lifetime = rospy.Duration(2.5)
+            marker_array.markers.append(text_marker)
+
+        if marker_array.markers:
+            self.frontier_pub.publish(marker_array)
+
+    # --- Bidding and Task Allocation --- #
+    def _bidding_cycle_callback(self, event):
+        """Timer callback to evaluate frontiers and potentially bid or select task."""
+        if self.current_path or self.avoidance_state != 'none':
+            # Don't bid or select new task if already following path or avoiding/recovering
+            return
+            
+        open_frontiers = []
+        for fid, fdata in self.known_frontiers.items():
+            if fdata.get('status', 'open') == 'open':
+                # Check reachability before considering it truly open for bidding
+                start_grid = self._world_to_grid(self.agent.position[0], self.agent.position[1])
+                goal_grid = fdata.get('centroid_grid')
+                if goal_grid and self._is_reachable(start_grid, tuple(goal_grid)): # Use quick check
+                     open_frontiers.append(fdata)
+                else:
+                     rospy.logdebug(f"Agent {self.agent.agent_id}: Frontier {fid} at {goal_grid} is open but unreachable from {start_grid}, skipping bid.")
+
+        if not open_frontiers:
+            rospy.logdebug_throttle(5.0, f"Agent {self.agent.agent_id}: No reachable open frontiers found.")
+            # Check if we should terminate due to inactivity
+            self._check_termination()
+            return
+        else:
+             # Activity detected (found open frontiers), reset inactivity timer
+             self.last_activity_time = rospy.Time.now()
+
+        # --- Simple Selection (Highest Utility) - Replace with proper bidding later --- #
+        best_frontier = None
+        max_utility = -float('inf')
+        best_cost = float('inf') # Store cost for logging
+
+        for frontier in open_frontiers:
+            utility, cost = self._calculate_utility(frontier)
+            rospy.logdebug(f"Agent {self.agent.agent_id}: Evaluating Frontier {frontier['id']}. Cost: {cost:.2f}, Util: {utility:.4f}")
+            if utility > max_utility:
+                max_utility = utility
+                best_cost = cost
+                best_frontier = frontier
+        # --------------------------------------------------------------------------- #
+
+        if best_frontier:
+            # --- Replace with Bidding Logic --- #
+            # For now, directly claim the best one we found
+            rospy.loginfo(f"Agent {self.agent.agent_id}: Selected task {best_frontier['id']} (Cost: {best_cost:.2f}, Util: {max_utility:.4f}) for claim.") # Add closing quote
+            self._claim_frontier(best_frontier['id'])
+            # --- End Bidding Logic Placeholder --- #
+        else:
+            rospy.logdebug(f"Agent {self.agent.agent_id}: Could not select a best frontier from available open ones.")
+
+    def _calculate_utility(self, frontier_data):
+        """Calculate the utility of exploring a given frontier.
+        
+           Higher utility is better.
+
+           Returns:
+               tuple: A tuple containing (utility, cost). utility is higher for better frontiers,
+                      cost is an estimate (e.g., A* path cost).
+        """
+        try:
+            start_pos = self.agent.position[:2]
+            goal_pos_world = np.array(frontier_data['centroid_world'])
+            start_grid = self._world_to_grid(start_pos[0], start_pos[1])
+            goal_grid = tuple(frontier_data['centroid_grid'])
+
+            # Check bounds for start/goal grid coords
+            if not (0 <= start_grid[0] < self.grid_dims and 0 <= start_grid[1] < self.grid_dims):
+                rospy.logwarn(f"Agent {self.agent.agent_id} UtilCalc: Start position {start_pos} is outside grid! Cannot calculate utility.")
+                return -float('inf'), float('inf')
+            if not (0 <= goal_grid[0] < self.grid_dims and 0 <= goal_grid[1] < self.grid_dims):
+                 rospy.logwarn(f"Agent {self.agent.agent_id} UtilCalc: Goal grid {goal_grid} for frontier {frontier_data['id']} is outside grid! Cannot calculate utility.")
+                 return -float('inf'), float('inf')
+
+            # Estimate cost using A* path length
+            path, cost = self._find_path(start_grid, goal_grid)
+
+            if path is None:
+                 # If unreachable by A* (should have been caught by BFS, but double-check)
+                 rospy.logwarn_throttle(5.0, f"Agent {self.agent.agent_id} UtilCalc: Frontier {frontier_data['id']} at {goal_grid} determined unreachable by A* from {start_grid}.")
+                 return -float('inf'), float('inf')
+            
+            # Use the A* score directly for now, lower is better.
+            cost_value = cost 
+
+            # Information Gain (simple: size of frontier?)
+            info_gain = frontier_data.get('size', 1) # Default to 1 if size missing
+
+            # Utility = Information Gain / Cost (higher is better)
+            # Avoid division by zero
+            if cost_value <= 1e-6:
+                utility = float('inf') # Very close, high utility
+            else:
+                 # Combine info gain and cost - using inverse cost for simplicity
+                 utility = 1.0 / cost_value # Lower cost => Higher utility
+                 # Optionally add info_gain influence: utility = info_gain / cost_value
+            
+            return utility, cost_value
+
+        except Exception as e:
+            rospy.logerr(f"Agent {self.agent.agent_id}: Error calculating utility for frontier {frontier_data.get('id', 'N/A')}: {e}")
+            import traceback
+            traceback.print_exc() # Print stack trace for debugging
+            return -float('inf'), float('inf')
+
+    def _check_termination(self):
+        # Implement any additional logic you want to execute when checking for termination
+        # This is just a placeholder and should be replaced with actual logic
+        pass
+
+    # --- ADD BACK MISSING METHODS --- #
+
+    def _claim_frontier(self, frontier_id):
+        """Claim a frontier, publish the claim, and plan path."""
+        if frontier_id not in self.known_frontiers:
+            rospy.logerr(f"Agent {self.agent.agent_id}: Cannot claim non-existent frontier {frontier_id}")
+            return
+
+        frontier_data = self.known_frontiers[frontier_id]
+        if frontier_data.get('status', 'open') != 'open':
+            rospy.logwarn(f"Agent {self.agent.agent_id}: Cannot claim frontier {frontier_id}, status is {frontier_data.get('status')}.")
+            return
+
+        # Update local status and publish claim
+        rospy.loginfo(f"Agent {self.agent.agent_id}: Publishing claim for frontier {frontier_id}")
+        frontier_data['status'] = 'claimed'
+        frontier_data['claimant_agent_id'] = self.agent.agent_id
+        frontier_data['last_updated'] = rospy.Time.now().to_sec()
+        self.known_frontiers[frontier_id] = frontier_data # Update local knowledge
+        self.agent.share_data('frontiers', frontier_data) # Publish claim
+        self.current_target_frontier_id = frontier_id
+        # Reset path failure count when claiming
+        self.path_planning_failures.pop(frontier_id, None)
+
+        # Plan path
+        start_grid = self._world_to_grid(self.agent.position[0], self.agent.position[1])
+        goal_grid = tuple(frontier_data['centroid_grid'])
+        
+        # Ensure start_grid is valid before planning
+        if not (0 <= start_grid[0] < self.grid_dims and 0 <= start_grid[1] < self.grid_dims):
+             rospy.logerr(f"Agent {self.agent.agent_id} PathPlan: Start grid {start_grid} invalid. Cannot plan path to {frontier_id}.")
+             self._release_claim(frontier_id) # Release if we can't even start planning
+             return
+
+        rospy.loginfo(f"Agent {self.agent.agent_id}: Planning path from {start_grid} to {goal_grid} for frontier {frontier_id}")
+        path, cost = self._find_path(start_grid, goal_grid)
+
+        if path:
+            rospy.loginfo(f"Agent {self.agent.agent_id}: Path found for {frontier_id} (Cost: {cost:.2f}, Length: {len(path)} steps). Starting navigation.")
+            self.current_path = path
+            # Start path index at 1 to target the first waypoint, not the start cell itself
+            self.current_path_index = 1 
+            self._publish_current_path() # Visualize path
+            # Reset path progress tracking
+            self.last_path_position = None
+            self.last_path_progress_time = None
+        else:
+            rospy.logwarn(f"Agent {self.agent.agent_id}: Path planning failed for claimed frontier {frontier_id}. Releasing claim.")
+            self._release_claim(frontier_id)
+            # Increment failure count after failed planning attempt
+            failures = self.path_planning_failures.get(frontier_id, 0) + 1
+            self.path_planning_failures[frontier_id] = failures
+            rospy.logwarn(f"Agent {self.agent.agent_id}: Path planning failure increments count for {frontier_id} to {failures}")
+
+    def _mark_frontier_explored(self, frontier_id):
+        """Mark a frontier as explored and publish the update."""
+        if frontier_id and frontier_id in self.known_frontiers:
+            fdata = self.known_frontiers[frontier_id]
+            if fdata.get('status') != 'explored': # Only update if not already marked
+                 rospy.loginfo(f"Agent {self.agent.agent_id}: Marking frontier {frontier_id} as explored.")
+                 fdata['status'] = 'explored'
+                 fdata['last_updated'] = rospy.Time.now().to_sec()
+                 # Keep claimant ID for record? Optional.
+                 # fdata['claimant_agent_id'] = -1 # Or keep the ID of who explored it?
+                 self.known_frontiers[frontier_id] = fdata
+                 self.agent.share_data('frontiers', fdata)
+        else:
+            rospy.logwarn(f"Agent {self.agent.agent_id}: Tried to mark non-existent or None frontier as explored: {frontier_id}")
+
+    def _release_claim(self, frontier_id):
+        """Release the claim on a frontier and publish the update."""
+        if frontier_id and frontier_id in self.known_frontiers:
+            # Check if we are actually the claimant
+            if self.known_frontiers[frontier_id].get('claimant_agent_id') == self.agent.agent_id:
+                rospy.loginfo(f"Agent {self.agent.agent_id}: Releasing claim on frontier {frontier_id}.")
+                update_data = self.known_frontiers[frontier_id].copy()
+                update_data['status'] = 'open'
+                update_data['claimant_agent_id'] = -1
+                update_data['last_updated'] = rospy.Time.now().to_sec()
+                # Publish the update
+                self.agent.share_data('frontiers', update_data)
+                # Update local knowledge
+                self.known_frontiers[frontier_id] = update_data
+                # Clear target and path if this was the current target
+                if self.current_target_frontier_id == frontier_id:
+                    self.current_target_frontier_id = None
+                    self.current_path = None
+                    self._publish_current_path() # Publish empty path
+                    # Reset path progress tracking
+                    self.last_path_position = None
+                    self.last_path_progress_time = None
+                # Reset failure count for this frontier
+                self.path_planning_failures.pop(frontier_id, None)
+            else:
+                 rospy.logdebug(f"Agent {self.agent.agent_id}: Tried to release claim on {frontier_id}, but not the claimant ({self.known_frontiers[frontier_id].get('claimant_agent_id')}).")
+        else:
+             rospy.logwarn(f"Agent {self.agent.agent_id}: Tried to release claim on non-existent or None frontier: {frontier_id}")
+
+    # --- Path Planning (A*) --- #
+    # ... (rest of the file, including A* methods, _is_reachable, etc.) ...
